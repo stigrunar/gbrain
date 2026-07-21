@@ -19,6 +19,9 @@ export const ollama: Recipe = {
         'mxbai-embed-large',
         'all-minilm',
         'qwen3-embed-8b',
+        'qwen3-embedding:8b',
+        'qwen3-embedding:4b',
+        'qwen3-embedding:0.6b',
         'snowflake-arctic-embed-l-v2',
         'bge-m3',
       ],
@@ -38,6 +41,10 @@ export const ollama: Recipe = {
         'bge-m3': 1024,
       },
       default_dims: 768, // nomic-embed-text native dim
+      // Ollama honors the OpenAI `dimensions` param for Qwen3-Embedding
+      // Matryoshka output. Keep the allow-list explicit so init-time
+      // dimension validation accepts only known MRL steps.
+      dims_options: [256, 512, 768, 1024, 1536, 2048, 2560, 4096],
       trust_custom_dims: true, // #2271: local models carry varied native dims
       cost_per_1m_tokens_usd: 0,
       price_last_verified: '2026-04-20',

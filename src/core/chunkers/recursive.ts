@@ -17,7 +17,13 @@
  * Lossless invariant: non-overlapping portions reassemble to original.
  */
 
-import { countCJKAwareWords, CJK_SENTENCE_DELIMITERS, CJK_CLAUSE_DELIMITERS } from '../cjk.ts';
+import {
+  countCJKAwareWords,
+  CJK_SENTENCE_DELIMITERS,
+  CJK_CLAUSE_DELIMITERS,
+  charEmbedTokenWeight,
+  estimateEmbeddingTokens,
+} from '../cjk.ts';
 
 /**
  * Markdown chunker version. Folded into the per-page chunker_version column
@@ -33,8 +39,11 @@ import { countCJKAwareWords, CJK_SENTENCE_DELIMITERS, CJK_CLAUSE_DELIMITERS } fr
  * re-embed (not re-chunk) so existing pages pick up the wrapper on the
  * post-upgrade reembed sweep. See
  * `src/core/contextual-retrieval-service.ts`.
+ *
+ * v4: estimated-token cap plus a whitespace-word floor. URL/JSON-heavy
+ * chunks are split without silently dropping their content.
  */
-export const MARKDOWN_CHUNKER_VERSION = 3;
+export const MARKDOWN_CHUNKER_VERSION = 4;
 
 const DELIMITERS: string[][] = [
   ['\n\n'],                          // L0: paragraphs
@@ -48,7 +57,11 @@ export interface ChunkOptions {
   chunkSize?: number;    // target words per chunk (default 300)
   chunkOverlap?: number; // overlap words (default 50)
   maxChars?: number;     // hard cap on any chunk's char length (default 6000)
+  /** Hard cap on estimated embedding tokens (default 1500). */
+  maxTokens?: number;
 }
+
+export const DEFAULT_MAX_EST_TOKENS = 1500;
 
 export interface TextChunk {
   text: string;
@@ -73,6 +86,7 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   const chunkSize = opts?.chunkSize || 300;
   const chunkOverlap = opts?.chunkOverlap || 50;
   const maxChars = opts?.maxChars || 6000;
+  const maxTokens = opts?.maxTokens || DEFAULT_MAX_EST_TOKENS;
 
   if (!text || text.trim().length === 0) return [];
 
@@ -89,8 +103,9 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
 
   const wordCount = countWords(stripped);
   if (wordCount <= chunkSize) {
-    // Single-chunk path: still apply the maxChars cap.
-    const capped = capByChars(stripped.trim(), maxChars);
+    // Single-chunk path: apply both caps before returning.
+    const capped = capByChars(stripped.trim(), maxChars)
+      .flatMap(t => capByEstimatedTokens(t, maxTokens));
     return capped.map((t, i) => ({ text: t, index: i }));
   }
 
@@ -103,7 +118,9 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   // exceed 8192 OpenAI embedding tokens at any word count).
   const capped: string[] = [];
   for (const chunk of withOverlap) {
-    capped.push(...capByChars(chunk.trim(), maxChars));
+    for (const piece of capByChars(chunk.trim(), maxChars)) {
+      capped.push(...capByEstimatedTokens(piece, maxTokens));
+    }
   }
   return capped.map((t, i) => ({ text: t, index: i }));
 }
@@ -128,6 +145,52 @@ function capByChars(text: string, maxChars: number): string[] {
     const slice = text.slice(i, i + maxChars).trim();
     if (slice.length > 0) out.push(slice);
     if (i + maxChars >= text.length) break;
+  }
+  return out;
+}
+
+const TOKEN_CAP_CUT_LOOKBACK = 300;
+
+/**
+ * Split a chunk at estimated-token boundaries without dropping its content.
+ * Newlines and whitespace within the lookback window are preferred cut points;
+ * a hard cut is used for whitespace-less URLs, JSON, and blobs.
+ */
+export function capByEstimatedTokens(text: string, maxTokens: number): string[] {
+  if (text.length === 0) return [];
+  if (estimateEmbeddingTokens(text) <= maxTokens) return [text];
+
+  const out: string[] = [];
+  let start = 0;
+  while (start < text.length) {
+    let est = 0;
+    let end = start;
+    while (end < text.length) {
+      const weight = charEmbedTokenWeight(text.charCodeAt(end));
+      if (est + weight > maxTokens && end > start) break;
+      est += weight;
+      end++;
+    }
+
+    if (end < text.length) {
+      const windowStart = Math.max(start + 1, end - TOKEN_CAP_CUT_LOOKBACK);
+      let cut = text.lastIndexOf('\n', end - 1);
+      if (cut < windowStart) {
+        cut = -1;
+        for (let i = end - 1; i >= windowStart; i--) {
+          const code = text.charCodeAt(i);
+          if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) {
+            cut = i;
+            break;
+          }
+        }
+      }
+      if (cut >= windowStart) end = cut + 1;
+    }
+
+    const slice = text.slice(start, end);
+    if (slice.length > 0) out.push(slice);
+    start = end;
   }
   return out;
 }
@@ -319,5 +382,7 @@ function extractTrailingContext(text: string, targetWords: number): string {
  * means.
  */
 function countWords(text: string): number {
-  return countCJKAwareWords(text);
+  const cjkAware = countCJKAwareWords(text);
+  const nonWhitespace = text.replace(/\s/g, '').length;
+  return Math.max(cjkAware, Math.ceil(nonWhitespace / 6));
 }

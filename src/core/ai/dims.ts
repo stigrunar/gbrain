@@ -201,6 +201,12 @@ export function dimsProviderOptions(
       // Anthropic has no embedding model.
       return undefined;
     case 'openai-compatible':
+      // Qwen3-Embedding via Ollama/llama-server — Matryoshka (MRL), accepts
+      // output dimensions through the OpenAI-compatible `dimensions` param.
+      // Qwen3 embeddings are symmetric, so inputType is intentionally ignored.
+      if (modelId.startsWith('qwen3-embedding')) {
+        return { openaiCompatible: { dimensions: dims } };
+      }
       // ZE zembed-1 — flexible Matryoshka dims + asymmetric input_type.
       // Lives BEFORE the generic openai-compatible fall-through to avoid
       // sending input_type to providers (Azure/DashScope/Zhipu) that

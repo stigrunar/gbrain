@@ -55,6 +55,10 @@ import { resolveModel, TIER_DEFAULTS } from '../model-config.ts';
 import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
+import {
+  isOllamaQwen3Embedding06B,
+  prepareOllamaQwen3EmbeddingInput,
+} from './qwen3-embedding.ts';
 import { hasAnthropicKey } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
@@ -1678,14 +1682,17 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  const useQwen3Policy = isOllamaQwen3Embedding06B(recipe.id, modelId);
+  const transportTexts = useQwen3Policy
+    ? texts.map(t => prepareOllamaQwen3EmbeddingInput(t, opts?.inputType ?? 'document'))
+    : texts.map(t => (t ?? '').slice(0, MAX_CHARS));
 
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the
   // actual total reported by the SDK across all sub-batches.
   if (tracker) {
     const charsPerToken = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
-    const totalChars = truncated.reduce((s, t) => s + t.length, 0);
+    const totalChars = transportTexts.reduce((s, t) => s + t.length, 0);
     const estimatedInputTokens = Math.ceil(totalChars / Math.max(charsPerToken, 1));
     tracker.reserve({
       modelId: `${recipe.id}:${modelId}`,
@@ -1715,8 +1722,8 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   // Pre-split is gated on max_batch_tokens. Recipes without it (e.g. OpenAI)
   // ride the fast path: one embedMany call, no recursion safety net.
   const tokenBatches = maxBatchTokens
-    ? splitByTokenBudget(truncated, Math.floor(maxBatchTokens * effectiveSafetyFactor(recipe)), charsPerToken)
-    : [truncated];
+    ? splitByTokenBudget(transportTexts, Math.floor(maxBatchTokens * effectiveSafetyFactor(recipe)), charsPerToken)
+    : [transportTexts];
 
   // Hard COUNT cap (e.g. llama-server's "maximum allowed batch size 32").
   // Token budget can't bound item count, so re-split any oversized batch.
@@ -1739,12 +1746,12 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   } finally {
     if (tracker) {
       // Embed token usage is not surfaced by the AI SDK shape we use; charge
-      // based on the truncated input character count using the recipe's
+      // based on the transported input character count using the recipe's
       // chars-per-token. On failure, A3 amended says charge the pessimistic
       // estimate too — embed has no output side, so the input estimate IS
       // the worst case.
       const charsPerToken = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
-      const totalChars = truncated.reduce((s, t) => s + t.length, 0);
+      const totalChars = transportTexts.reduce((s, t) => s + t.length, 0);
       const inputTokens = Math.ceil(totalChars / Math.max(charsPerToken, 1));
       try {
         tracker.record({

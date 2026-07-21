@@ -143,9 +143,13 @@ Set `ZHIPUAI_API_KEY`. Models: `embedding-3` (current; Matryoshka 256-2048 dims)
 
 No env required — Ollama runs unauthenticated locally. Optional `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`) and `OLLAMA_API_KEY` (for auth-enabled deployments).
 
-Recipe ships with `nomic-embed-text` (768d, recommended), `mxbai-embed-large` (1024d), `all-minilm` (384d), plus the larger modern embedders `qwen3-embed-8b` (4096d) and `snowflake-arctic-embed-l-v2` (1024d). `gbrain providers test --model ollama:nomic-embed-text` smoke-tests the local install.
+Recipe ships with `nomic-embed-text` (768d, recommended), `mxbai-embed-large` (1024d), `all-minilm` (384d), Qwen3-Embedding (`qwen3-embedding:0.6b`, `:4b`, and `:8b`), plus `snowflake-arctic-embed-l-v2` (1024d). `gbrain providers test --model ollama:nomic-embed-text` smoke-tests the local install.
 
 The recipe default is `nomic-embed-text`'s 768 dims. If you run one of the larger models, declare its native dimension with `--embedding-dimensions <N>` at init — gbrain trusts the value you declare for local recipes instead of rejecting a non-768 width.
+
+Qwen3-Embedding supports server-side Matryoshka dimensions through Ollama's OpenAI-compatible `dimensions` parameter. For `ollama:qwen3-embedding:0.6b`, `embedding_dimensions=768` is an allowed setting; gbrain does not client-project the returned vector. Query inputs receive the exact prefix `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: `, while document inputs are sent byte-for-byte unchanged. A returned dimension mismatch remains a loud error.
+
+The recursive and code chunkers also apply a conservative estimated-token cap (1500 by default). Pathological URL, CJK, and JSON content is split at safe boundaries or hard-cut when necessary, preserving content rather than silently truncating it.
 
 ### llama-server (local, llama.cpp)
 
