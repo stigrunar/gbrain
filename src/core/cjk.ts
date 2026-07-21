@@ -65,3 +65,44 @@ export function countCJKAwareWords(s: string): number {
 export function escapeLikePattern(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
+
+/**
+ * Conservative per-character embedding-token weights for chunk-size safety.
+ * These intentionally overestimate tokenization for URL/JSON/CJK-heavy text
+ * so chunks are split before a provider's request limit is reached.
+ */
+export const EMBED_TOKEN_WEIGHT_CJK = 1.0;
+export const EMBED_TOKEN_WEIGHT_OTHER = 0.75;
+export const EMBED_TOKEN_WEIGHT_WS = 0.1;
+
+/** BMP CJK check by UTF-16 code unit — same ranges as CJK_SLUG_CHARS. */
+export function isCJKCodeUnit(code: number): boolean {
+  return (
+    (code >= 0x4e00 && code <= 0x9fff) || // Han
+    (code >= 0x3040 && code <= 0x309f) || // Hiragana
+    (code >= 0x30a0 && code <= 0x30ff) || // Katakana
+    (code >= 0xac00 && code <= 0xd7af)    // Hangul Syllables
+  );
+}
+
+/** Per-code-unit token weight used by the tokenizer-free chunk cap. */
+export function charEmbedTokenWeight(code: number): number {
+  if (isCJKCodeUnit(code)) return EMBED_TOKEN_WEIGHT_CJK;
+  if (
+    code === 0x20 || (code >= 0x09 && code <= 0x0d) ||
+    code === 0xa0 || code === 0x3000
+  ) {
+    return EMBED_TOKEN_WEIGHT_WS;
+  }
+  return EMBED_TOKEN_WEIGHT_OTHER;
+}
+
+/** Conservative embedding-token estimate used by the recursive chunker. */
+export function estimateEmbeddingTokens(s: string): number {
+  if (s.length === 0) return 0;
+  let est = 0;
+  for (let i = 0; i < s.length; i++) {
+    est += charEmbedTokenWeight(s.charCodeAt(i));
+  }
+  return Math.ceil(est);
+}

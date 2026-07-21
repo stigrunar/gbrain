@@ -18,8 +18,9 @@
  * at runtime.
  */
 
-import { chunkText as recursiveChunk } from './recursive.ts';
+import { chunkText as recursiveChunk, capByEstimatedTokens, DEFAULT_MAX_EST_TOKENS } from './recursive.ts';
 import { buildQualifiedName } from './qualified-names.ts';
+import { estimateEmbeddingTokens } from '../cjk.ts';
 
 // Embed the tree-sitter runtime + per-language grammars as files.
 // `with { type: 'file' }` returns a path (string) at runtime. Bun bundles
@@ -111,7 +112,10 @@ import G_ZIG from '../../assets/wasm/grammars/tree-sitter-zig.wasm' with { type:
 // chunks get the new columns populated. Without this, the v28 backfill
 // gives every existing chunk a search_vector but subsequent Layer 5 AST
 // work would silently no-op.
-export const CHUNKER_VERSION = 4;
+//
+// v5: estimated-token hard cap on AST-path chunks, including giant nodes that
+// tree-sitter cannot subdivide. Fallback-path chunks are capped by recursiveChunk.
+export const CHUNKER_VERSION = 5;
 
 // Lazy-loaded tree-sitter module (v0.22.x API: Parser is default export)
 let Parser: typeof import('web-tree-sitter') | null = null;
@@ -708,7 +712,7 @@ export async function chunkCodeTextFull(
     if (chunks.length === 0) {
       return { chunks: fallbackChunks(source, filePath, language, opts), edges: rawEdges };
     }
-    return { chunks: mergeSmallSiblings(chunks, chunkTarget), edges: rawEdges };
+    return { chunks: capCodeChunks(mergeSmallSiblings(chunks, chunkTarget)), edges: rawEdges };
   } catch {
     return { chunks: fallbackChunks(source, filePath, language, opts), edges: [] };
   } finally {
@@ -789,6 +793,21 @@ function mergeSmallSiblings(chunks: CodeChunk[], chunkTarget: number): CodeChunk
     i = j;
   }
   return merged;
+}
+
+/** Final safety pass for AST chunks that tree-sitter cannot subdivide. */
+function capCodeChunks(chunks: CodeChunk[]): CodeChunk[] {
+  if (chunks.every(c => estimateEmbeddingTokens(c.text) <= DEFAULT_MAX_EST_TOKENS)) {
+    return chunks;
+  }
+  const out: CodeChunk[] = [];
+  for (const c of chunks) {
+    const pieces = capByEstimatedTokens(c.text, DEFAULT_MAX_EST_TOKENS);
+    for (const piece of pieces) {
+      out.push({ ...c, text: piece, index: out.length, metadata: { ...c.metadata } });
+    }
+  }
+  return out;
 }
 
 function buildMergedChunk(group: CodeChunk[], index: number): CodeChunk {
