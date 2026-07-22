@@ -26,6 +26,7 @@ import { llamaServerReranker } from './llama-server-reranker.ts';
 import { moonshot } from './moonshot.ts';
 import { mistral } from './mistral.ts';
 import { nvidia } from './nvidia.ts';
+import { hermesCodex } from './hermes-codex.ts';
 
 const ALL: Recipe[] = [
   openai,
@@ -48,8 +49,8 @@ const ALL: Recipe[] = [
   moonshot,
   mistral,
   nvidia,
+  hermesCodex,
 ];
-
 /** Map from `provider:id` key to recipe. */
 export const RECIPES: Map<string, Recipe> = new Map(ALL.map(r => [r.id, r]));
 

@@ -156,6 +156,18 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Provider id prefixes whose chat calls are mediated by a local/subscription
+ * proxy rather than a metered API key. Price them at $0 for budget-gate
+ * purposes so max-cost bounded commands (SkillOpt, brainstorm, etc.) do not
+ * TX2 hard-fail before the local proxy can run. This does NOT claim the
+ * upstream service is free; it means GBrain cannot meter a user subscription
+ * through API token pricing.
+ */
+const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
+  'hermes-codex',
+]);
+
+/**
  * Look up `modelId` in the chat or embedding pricing maps. Returns a
  * per-1M-token price tuple, or null when unknown.
  *
@@ -193,6 +205,9 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   if (modelTail) {
     const tailHit = ANTHROPIC_PRICING[modelTail];
     if (tailHit) return tailHit;
+  }
+  if (kind === 'chat' && providerId && FREE_LOCAL_CHAT_PROVIDERS.has(providerId)) {
+    return { input: 0, output: 0 };
   }
   // v0.40.6.1: zero-price local-inference rerank providers so the budget
   // tracker's TX2 hard-fail doesn't trip on `llama-server-reranker:<model>`
