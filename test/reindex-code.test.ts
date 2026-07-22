@@ -57,6 +57,17 @@ describe('Layer 13 E2 — runReindexCode', () => {
       frontmatter: { language: 'python', file: 'src/bar.py' },
     });
 
+    // One valid empty code page. Empty package marker files have no chunks and
+    // must be treated as an intentional skip, not missing/corrupt content.
+    await engine.putPage('src-empty-init-py', {
+      type: 'code',
+      page_kind: 'code',
+      title: 'src/empty/__init__.py (python)',
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: { language: 'python', file: 'src/empty/__init__.py' },
+    });
+
     // One code page with missing frontmatter.file — should fail cleanly.
     await engine.putPage('src-bad-ts', {
       type: 'code',
@@ -86,7 +97,7 @@ describe('Layer 13 E2 — runReindexCode', () => {
   test('counts code pages, ignores markdown', async () => {
     const result = await runReindexCode(engine, { dryRun: true, noEmbed: true });
     expect(result.status).toBe('dry_run');
-    expect(result.codePages).toBe(3); // foo, bar, bad — not the guide
+    expect(result.codePages).toBe(4); // foo, bar, empty, bad — not the guide
   });
 
   test('dry-run reports cost + token count without importing', async () => {
@@ -101,7 +112,9 @@ describe('Layer 13 E2 — runReindexCode', () => {
   test('reindex walks every code page, failures counted per-slug', async () => {
     const result = await runReindexCode(engine, { noEmbed: true });
     expect(result.status).toBe('ok');
-    expect(result.codePages).toBe(3);
+    expect(result.codePages).toBe(4);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.failures?.some(f => f.slug === 'src-empty-init-py')).not.toBe(true);
     // src-bad-ts has no frontmatter.file → fails cleanly.
     expect(result.failed).toBeGreaterThanOrEqual(1);
     expect(result.failures).toBeDefined();
@@ -126,6 +139,6 @@ describe('Layer 13 E2 — runReindexCode', () => {
       noEmbed: true,
       batchSize: 1,
     });
-    expect(result.codePages).toBe(3);
+    expect(result.codePages).toBe(4);
   });
 });
