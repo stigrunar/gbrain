@@ -110,12 +110,18 @@ function parseArgs(args: string[]): ReindexOpts {
  * hook for post-v81 brains. The simple `chunker_version OR mode IS NULL`
  * predicate covers the headline upgrade case the wave is shipping.
  */
-async function countPending(engine: BrainEngine): Promise<number> {
+async function countPending(engine: BrainEngine, includeContextualMode: boolean): Promise<number> {
+  // `--no-embed` cannot stamp contextual_retrieval_mode. Including NULL mode
+  // rows in that path makes every processed row remain pending, so a large
+  // invocation repeatedly reindexes its first batch while reporting progress.
+  const driftPredicate = includeContextualMode
+    ? '(chunker_version < $1 OR contextual_retrieval_mode IS NULL)'
+    : 'chunker_version < $1';
   const rows = await engine.executeRaw<{ count: string | number }>(
     `SELECT COUNT(*)::bigint AS count
        FROM pages
       WHERE page_kind = 'markdown'
-        AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
+        AND ${driftPredicate}
         AND deleted_at IS NULL`,
     [MARKDOWN_CHUNKER_VERSION],
   );
@@ -127,12 +133,15 @@ async function countPending(engine: BrainEngine): Promise<number> {
  * partial completion pick up where they left off without re-doing pages
  * whose chunker_version was already bumped.
  */
-async function readBatch(engine: BrainEngine, batchSize: number): Promise<Array<{ slug: string; source_path: string | null; compiled_truth: string; source_id: string }>> {
+async function readBatch(engine: BrainEngine, batchSize: number, includeContextualMode: boolean): Promise<Array<{ slug: string; source_path: string | null; compiled_truth: string; source_id: string }>> {
+  const driftPredicate = includeContextualMode
+    ? '(chunker_version < $1 OR contextual_retrieval_mode IS NULL)'
+    : 'chunker_version < $1';
   return engine.executeRaw(
     `SELECT slug, source_path, compiled_truth, source_id
        FROM pages
       WHERE page_kind = 'markdown'
-        AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
+        AND ${driftPredicate}
         AND deleted_at IS NULL
       ORDER BY id ASC
       LIMIT $2`,
@@ -155,7 +164,8 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     return { pending: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: !!opts.dryRun, chunkerVersion: MARKDOWN_CHUNKER_VERSION };
   }
 
-  const pending = await countPending(engine);
+  const includeContextualMode = !opts.noEmbed;
+  const pending = await countPending(engine, includeContextualMode);
 
   if (opts.json && pending === 0) {
     process.stdout.write(JSON.stringify({ pending: 0, reindexed: 0, skipped: 0, failed: 0, chunker_version: MARKDOWN_CHUNKER_VERSION }) + '\n');
@@ -190,7 +200,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
     const batchSize = Math.min(BATCH, remaining);
-    const batch = await readBatch(engine, batchSize);
+    const batch = await readBatch(engine, batchSize, includeContextualMode);
     if (batch.length === 0) break;
 
     // v0.41.15.0 (T10, D9): per-batch sliding pool. Counters are JS-

@@ -70,19 +70,25 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
 
   test('idempotent: re-run on a fully-updated brain reports nothing to do', async () => {
     await seedLegacyPage('note-e', 'body e');
-    // First pass with --no-embed bumps chunker_version but does NOT stamp
-    // contextual_retrieval_mode (import-file.ts:457-466 skips CR stamping
-    // when noEmbed). Then manually stamp CR mode so the brain is "fully
-    // updated" for the idempotency test. In production, embed (--no-embed
-    // OFF) does both; reindex tests use --no-embed to avoid API keys.
+    // `--no-embed` cannot stamp contextual_retrieval_mode, so its sweep must
+    // converge on chunker_version alone instead of selecting the same row on
+    // every invocation (and every batch of a large invocation).
     await runReindex(engine, ['--markdown', '--no-embed']);
-    await engine.executeRaw(
-      `UPDATE pages SET contextual_retrieval_mode = 'title'
-        WHERE slug = 'note-e' AND contextual_retrieval_mode IS NULL`,
-    );
     const second = await runReindex(engine, ['--markdown', '--no-embed']);
     expect(second.pending).toBe(0);
     expect(second.reindexed).toBe(0);
+  });
+
+  test('--no-embed ignores contextual-mode-only drift and terminates', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, type, title, compiled_truth, page_kind, chunker_version, contextual_retrieval_mode)
+       VALUES ('note-mode-null', 'note', 'note-mode-null', 'current body', 'markdown', $1, NULL)`,
+      [MARKDOWN_CHUNKER_VERSION],
+    );
+
+    const result = await runReindex(engine, ['--markdown', '--no-embed', '--dry-run']);
+    expect(result.pending).toBe(0);
+    expect(result.reindexed).toBe(0);
   });
 
   test('--limit caps the work done in one invocation', async () => {
