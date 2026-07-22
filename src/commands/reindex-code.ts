@@ -289,9 +289,11 @@ export async function runReindexCode(
               reporter.tick();
               return;
             }
-            if (!row.compiled_truth) {
-              failed++;
-              failures.push({ slug: row.slug, error: 'missing compiled_truth' });
+            if (row.compiled_truth === '') {
+              // Empty source files (for example Python package __init__.py)
+              // are valid code pages with no chunks to rebuild. Treat them as
+              // an intentional no-op, not corrupt/missing page content.
+              skipped++;
               reporter.tick();
               return;
             }
