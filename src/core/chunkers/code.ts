@@ -18,9 +18,9 @@
  * at runtime.
  */
 
-import { chunkText as recursiveChunk } from './recursive.ts';
+import { chunkText as recursiveChunk, capByEstimatedTokens, DEFAULT_MAX_EST_TOKENS } from './recursive.ts';
 import { buildQualifiedName } from './qualified-names.ts';
-import { CJK_SLUG_CHARS, CJK_RANGES_REGEX } from '../cjk.ts';
+import { CJK_SLUG_CHARS, estimateEmbeddingTokens } from '../cjk.ts';
 
 // Embed the tree-sitter runtime + per-language grammars as files.
 // `with { type: 'file' }` returns a path (string) at runtime. Bun bundles
@@ -177,8 +177,8 @@ export interface CodeChunkOptions {
    * the AST splitter can't break up (a giant object/array literal, a single
    * huge assignment, a massive template literal) would otherwise be emitted
    * whole and rejected by the embedder ("input exceeds context length").
-   * Chunks over this budget are recursively re-split. Default 2000 fits the
-   * smallest common embedder context (e.g. nomic-embed-text, 2048).
+   * Chunks over this budget are recursively re-split. Default 1500 leaves
+   * room for structured headers inside small embedder contexts.
    */
   maxChunkTokens?: number;
 }
@@ -562,7 +562,7 @@ export function parseWithTimeout(
 }
 
 const DEFAULT_CHUNKER_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_CHUNK_TOKENS = 2000;
+const DEFAULT_MAX_CHUNK_TOKENS = DEFAULT_MAX_EST_TOKENS;
 
 function resolveChunkerTimeoutMs(): number {
   const raw = process.env.GBRAIN_CHUNKER_TIMEOUT_MS;
@@ -846,17 +846,22 @@ function capOversizedChunks(
   opts: CodeChunkOptions,
 ): CodeChunk[] {
   const cap = opts.maxChunkTokens ?? DEFAULT_MAX_CHUNK_TOKENS;
-  if (!chunks.some((c) => estimateEmbedTokens(c.text) > cap)) return chunks;
+  if (!chunks.some((c) => estimateCodeChunkTokens(c.text) > cap)) return chunks;
   const out: CodeChunk[] = [];
   for (const c of chunks) {
-    if (estimateEmbedTokens(c.text) <= cap) {
+    if (estimateCodeChunkTokens(c.text) <= cap) {
       out.push({ ...c, index: out.length });
       continue;
     }
     // Strip the structured header ("[Lang] path:N-M symbol\n\n") so the splitter
-    // works on the raw body; buildChunk re-adds a header to each piece.
-    const body = c.text.replace(/^\[[^\]]+\] [^\n]+\n\n/, '');
-    for (const piece of splitToTokenBudget(body, cap, opts)) {
+    // works on the raw body; buildChunk re-adds a header to each piece. Reserve
+    // that header budget so the final emitted chunk, not just the body, is capped.
+    const match = c.text.match(/^(\[[^\]]+\] [^\n]+\n\n)([\s\S]*)$/);
+    const header = match ? match[1]! : '';
+    const body = match ? match[2]! : c.text;
+    const headerBudget = estimateCodeChunkTokens(header);
+    const bodyCap = Math.max(1, cap - headerBudget);
+    for (const piece of splitToTokenBudget(body, bodyCap, opts)) {
       if (!piece.trim()) continue;
       out.push(buildChunk({
         body: piece,
@@ -875,43 +880,18 @@ function capOversizedChunks(
 }
 
 /** Split `text` into pieces each estimated <= cap tokens. Word/line-aware
- *  (recursiveChunk) first; a hard character split is the last resort for
- *  content with no whitespace to break on. */
+ *  via the shared lossless embedding-token splitter. */
 function splitToTokenBudget(text: string, cap: number, opts: CodeChunkOptions): string[] {
-  const out: string[] = [];
-  const pieces = recursiveChunk(text, {
-    chunkSize: opts.fallbackChunkSizeWords ?? 300,
-    chunkOverlap: opts.fallbackOverlapWords ?? 50,
-  }).map((p) => p.text);
-  for (const piece of pieces) {
-    if (estimateEmbedTokens(piece) <= cap) {
-      out.push(piece);
-      continue;
-    }
-    // Hard-split slice size. Pure-ASCII pieces: ~3.5 chars/token is a
-    // conservative cl100k estimate for source text. CJK-containing pieces:
-    // the weighted estimate can reach 1 token/char, so budget 1 char/token
-    // to keep every slice under cap by construction.
-    const charBudget = Math.max(1, Math.floor(cap * (CJK_RANGES_REGEX.test(piece) ? 1 : 3.5)));
-    for (let i = 0; i < piece.length; i += charBudget) out.push(piece.slice(i, i + charBudget));
-  }
-  return out;
+  void opts;
+  return capByEstimatedTokens(text, cap);
 }
 
 const CJK_CHARS_G = new RegExp(`[${CJK_SLUG_CHARS}]`, 'g');
 
 /**
- * Embedding-safe token estimate for the oversize cap. estimateTokens
- * (cl100k) matches embedding-family tokenizers closely on pure-ASCII source
- * (measured identical on English prose and JSON vs Qwen3-Embedding), but
- * UNDERCOUNTS mixed CJK+ASCII chunks — measured −31% on URL-dense Korean
- * text vs the Qwen3 embedding tokenizer, which is exactly the shape that
- * overflows strict embedding backends (#2826). For chunks containing CJK,
- * take the max of cl100k and a per-char-class overestimate (CJK 1.0/char,
- * other non-whitespace 0.75/char, whitespace 0.1/char). CJK-DOMINANT text
- * is unaffected too: cl100k already counts it above the weighted form, so
- * max() returns the same value as today. Only mixed-script chunks — the
- * measured divergence class — estimate higher.
+ * Embedding-safe measurement for code chunks. ASCII stays bit-identical to
+ * cl100k; mixed CJK uses the greater of cl100k and the conservative weighted
+ * estimate so the strict-backend overflow class remains covered.
  */
 export function estimateEmbedTokens(text: string): number {
   const cjk = (text.match(CJK_CHARS_G) || []).length;
@@ -919,6 +899,12 @@ export function estimateEmbedTokens(text: string): number {
   const ws = (text.match(/\s/g) || []).length;
   const weighted = Math.ceil(cjk + (text.length - cjk - ws) * 0.75 + ws * 0.1);
   return Math.max(estimateTokens(text), weighted);
+}
+
+/** Strict internal cap: preserve upstream cl100k parity while retaining the
+ * Qwen-oriented conservative estimator used by the lossless splitter. */
+function estimateCodeChunkTokens(text: string): number {
+  return Math.max(estimateEmbedTokens(text), estimateEmbeddingTokens(text));
 }
 
 // ---------- Internals ----------

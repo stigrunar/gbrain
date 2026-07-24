@@ -34,6 +34,28 @@ function bigJsonBlock(targetChars: number): string {
 }
 
 describe('estimated-token cap — pathological content', () => {
+  test('fallback chunks cap the structured header without losing source content', async () => {
+    const source = Array.from({ length: 300 }, () => 'x'.repeat(7)).join(' ');
+    const chunks = await chunkCodeText(source, 'unknown.xyz');
+    const header = '[JavaScript] unknown.xyz:1-1 module\n\n';
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const [index, chunk] of chunks.entries()) {
+      expect(estimateEmbeddingTokens(chunk.text)).toBeLessThanOrEqual(DEFAULT_MAX_EST_TOKENS);
+      expect(chunk.index).toBe(index);
+      expect(chunk.metadata).toMatchObject({
+        symbolName: null,
+        symbolType: 'module',
+        filePath: 'unknown.xyz',
+        language: 'javascript',
+        startLine: 1,
+        endLine: 1,
+      });
+    }
+
+    expect(chunks.map(chunk => chunk.text.replace(header, '')).join('')).toBe(source);
+  });
+
   test('URL-dense CJK chunks remain under the cap and retain markers', () => {
     const chunks = chunkText(urlDenseKoreanRollup(60));
     expect(chunks.length).toBeGreaterThan(0);

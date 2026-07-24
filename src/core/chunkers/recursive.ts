@@ -42,8 +42,11 @@ import {
  *
  * v4: estimated-token cap plus a whitespace-word floor. URL/JSON-heavy
  * chunks are split without silently dropping their content.
+ * v5: fenced-code extraction and the recursive fallback now apply the final
+ * estimated-token cap after adding their structured headers, so capped output
+ * is lossless and stays within the embedding limit.
  */
-export const MARKDOWN_CHUNKER_VERSION = 4;
+export const MARKDOWN_CHUNKER_VERSION = 5;
 
 const DELIMITERS: string[][] = [
   ['\n\n'],                          // L0: paragraphs

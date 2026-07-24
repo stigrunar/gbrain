@@ -4,7 +4,7 @@
  * Explicit backfill for v0.19.0 → v0.21.0 brains. Layer 12's
  * `sources.chunker_version` gate forces a re-walk next sync on any source
  * whose working tree hasn't drifted, but users who want the benefits NOW
- * (before the next sync) get this: walk every page where type='code', read
+ * (before the next sync) get this: walk every page where page_kind='code', read
  * compiled_truth + frontmatter.file, re-import via importCodeFile. Pages
  * flow through the same code path as normal sync (chunker + embeddings +
  * content_hash folding), so a reindex is bit-identical to a fresh sync.
@@ -120,6 +120,7 @@ function printCodeModelNudge(decision: Extract<NudgeDecision, { shouldNudge: tru
 
 interface CodePageRow {
   slug: string;
+  source_id: string;
   compiled_truth: string;
   frontmatter: Record<string, unknown> | null;
 }
@@ -134,10 +135,10 @@ async function fetchCodePages(
   // compiled_truth + frontmatter anyway (not just the Page shape).
   const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
   const rows = await engine.executeRaw<CodePageRow>(
-    `SELECT p.slug, p.compiled_truth, p.frontmatter
+    `SELECT p.slug, p.source_id, p.compiled_truth, p.frontmatter
      FROM pages p
-     WHERE p.type = 'code' ${sourceClause}
-     ORDER BY p.slug
+     WHERE p.page_kind = 'code' ${sourceClause}
+     ORDER BY p.slug, p.source_id
      LIMIT ${batchSize} OFFSET ${offset}`,
   );
   return rows;
@@ -146,7 +147,7 @@ async function fetchCodePages(
 async function countCodePages(engine: BrainEngine, sourceId: string | undefined): Promise<number> {
   const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
   const rows = await engine.executeRaw<{ n: string | number }>(
-    `SELECT COUNT(*)::text AS n FROM pages p WHERE p.type = 'code' ${sourceClause}`,
+    `SELECT COUNT(*)::text AS n FROM pages p WHERE p.page_kind = 'code' ${sourceClause}`,
   );
   if (rows.length === 0) return 0;
   const raw = rows[0]!.n;
@@ -301,7 +302,7 @@ export async function runReindexCode(
               const result = await importCodeFile(engine, relPath, row.compiled_truth, {
                 noEmbed: opts.noEmbed,
                 force: opts.force,
-                sourceId: opts.sourceId,
+                sourceId: row.source_id,
               });
               if (result.status === 'imported') reindexed++;
               else if (result.status === 'skipped') skipped++;
