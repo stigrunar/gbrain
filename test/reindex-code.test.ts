@@ -15,6 +15,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runReindexCode } from '../src/commands/reindex-code.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { CHUNKER_VERSION } from '../src/core/chunkers/code.ts';
 
 describe('Layer 13 E2 — runReindexCode', () => {
   let engine: PGLiteEngine;
@@ -78,6 +79,17 @@ describe('Layer 13 E2 — runReindexCode', () => {
       frontmatter: { language: 'typescript' }, // no file
     });
 
+    // Legacy code page: old brains can have type='note' while page_kind keeps
+    // the durable code classification used by reindex-code.
+    await engine.putPage('src-legacy-note-ts', {
+      type: 'note' as any,
+      page_kind: 'code',
+      title: 'src/legacy-note.ts (typescript)',
+      compiled_truth: 'export const legacyNote = 1;\n',
+      timeline: '',
+      frontmatter: { language: 'typescript', file: 'src/legacy-note.ts' },
+    });
+
     // One markdown page that MUST be ignored.
     await engine.putPage('guides/not-code', {
       type: 'guide',
@@ -97,7 +109,7 @@ describe('Layer 13 E2 — runReindexCode', () => {
   test('counts code pages, ignores markdown', async () => {
     const result = await runReindexCode(engine, { dryRun: true, noEmbed: true });
     expect(result.status).toBe('dry_run');
-    expect(result.codePages).toBe(4); // foo, bar, empty, bad — not the guide
+    expect(result.codePages).toBe(5); // foo, bar, empty, bad, legacy — not the guide
   });
 
   test('dry-run reports cost + token count without importing', async () => {
@@ -112,13 +124,49 @@ describe('Layer 13 E2 — runReindexCode', () => {
   test('reindex walks every code page, failures counted per-slug', async () => {
     const result = await runReindexCode(engine, { noEmbed: true });
     expect(result.status).toBe('ok');
-    expect(result.codePages).toBe(4);
+    expect(result.codePages).toBe(5);
     expect(result.skipped).toBeGreaterThanOrEqual(1);
     expect(result.failures?.some(f => f.slug === 'src-empty-init-py')).not.toBe(true);
     // src-bad-ts has no frontmatter.file → fails cleanly.
     expect(result.failed).toBeGreaterThanOrEqual(1);
     expect(result.failures).toBeDefined();
     expect(result.failures!.some(f => f.slug === 'src-bad-ts')).toBe(true);
+
+    const legacy = await engine.getPage('src-legacy-note-ts');
+    expect(legacy?.type).toBe('code');
+    const stamps = await engine.executeRaw<{ slug: string; chunker_version: number }>(
+      `SELECT slug, chunker_version FROM pages
+       WHERE source_id = 'default' AND slug IN ('src-foo-ts', 'src-bar-py', 'src-legacy-note-ts')
+       ORDER BY slug`,
+    );
+    expect(stamps).toHaveLength(3);
+    expect(stamps.every((row) => row.chunker_version === CHUNKER_VERSION)).toBe(true);
+  });
+
+  test('global mode reindexes legacy pages in each source without default duplicates', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('second-source', 'second-source') ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('src-foo-ts', {
+      type: 'code',
+      page_kind: 'code',
+      title: 'src/foo.ts (typescript)',
+      compiled_truth: 'export function fooFromSecondSource() { return 7; }\n',
+      timeline: '',
+      frontmatter: { language: 'typescript', file: 'src/foo.ts' },
+    }, { sourceId: 'second-source' });
+
+    const result = await runReindexCode(engine, { noEmbed: true });
+    expect(result.status).toBe('ok');
+
+    const rows = await engine.executeRaw<{ source_id: string; compiled_truth: string; chunker_version: number }>(
+      `SELECT source_id, compiled_truth, chunker_version FROM pages
+       WHERE slug = 'src-foo-ts' ORDER BY source_id`,
+    );
+    expect(rows.map((row) => row.source_id)).toEqual(['default', 'second-source']);
+    expect(rows[0]!.compiled_truth).toContain('function foo()');
+    expect(rows[1]!.compiled_truth).toContain('fooFromSecondSource');
+    expect(rows.every((row) => row.chunker_version === CHUNKER_VERSION)).toBe(true);
   });
 
   test('empty brain returns ok with zero counts', async () => {
@@ -139,6 +187,6 @@ describe('Layer 13 E2 — runReindexCode', () => {
       noEmbed: true,
       batchSize: 1,
     });
-    expect(result.codePages).toBe(4);
+    expect(result.codePages).toBe(6);
   });
 });

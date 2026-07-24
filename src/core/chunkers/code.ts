@@ -843,13 +843,15 @@ function fallbackChunks(
 ): CodeChunk[] {
   const size = opts.fallbackChunkSizeWords ?? 300;
   const overlap = opts.fallbackOverlapWords ?? 50;
-  return recursiveChunk(source, { chunkSize: size, chunkOverlap: overlap }).map((chunk, index) =>
-    buildChunk({
-      body: chunk.text, filePath, language,
-      symbolName: null, symbolType: 'module',
-      startLine: 1, endLine: countLines(chunk.text),
-      index,
-    }),
+  return capCodeChunks(
+    recursiveChunk(source, { chunkSize: size, chunkOverlap: overlap }).map((chunk, index) =>
+      buildChunk({
+        body: chunk.text, filePath, language,
+        symbolName: null, symbolType: 'module',
+        startLine: 1, endLine: countLines(chunk.text),
+        index,
+      }),
+    ),
   );
 }
 

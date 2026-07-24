@@ -1034,12 +1034,13 @@ export async function importFromFile(
 /**
  * Import a code file. Bypasses markdown parsing entirely.
  * Uses tree-sitter code chunker for semantic splitting.
- * Page type is 'code', slug includes file extension.
+ * Page kind is 'code', slug includes file extension. The legacy page type is
+ * normalized to 'code' on import.
  */
 /**
  * v0.31.2 (PR1 commit 10): facts backstop wiring decision.
  *
- * Code pages have `type: 'code'` which the `isFactsBackstopEligible`
+ * Code pages have `page_kind: 'code'` and `type: 'code'` after import, which the `isFactsBackstopEligible`
  * predicate (src/core/facts/eligibility.ts) rejects with `kind:code`.
  * Wiring `runFactsBackstop` here would always produce a no-op envelope.
  * The wiring is intentionally omitted — when README extraction or
@@ -1177,6 +1178,7 @@ export async function importCodeFile(
       timeline: '',
       frontmatter: { language: lang, file: relativePath },
       content_hash: hash,
+      chunker_version: CHUNKER_VERSION,
     }, txOpts);
 
     await tx.addTag(slug, 'code', txOpts);
