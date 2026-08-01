@@ -20,7 +20,14 @@
 
 import { chunkText as recursiveChunk, capByEstimatedTokens, DEFAULT_MAX_EST_TOKENS } from './recursive.ts';
 import { buildQualifiedName } from './qualified-names.ts';
-import { CJK_SLUG_CHARS, estimateEmbeddingTokens } from '../cjk.ts';
+import { estimateTokens, estimateEmbedTokens, estimateEmbedTokensCeiling } from './token-estimate.ts';
+import { estimateEmbeddingTokens } from '../cjk.ts';
+
+// Both estimators moved to token-estimate.ts (#3477 follow-up) so
+// recursive.ts can share them without an import cycle. Re-exported here:
+// commands/sync.ts, commands/reindex-code.ts, and tests import them from
+// this module.
+export { estimateTokens, estimateEmbedTokens } from './token-estimate.ts';
 
 // Embed the tree-sitter runtime + per-language grammars as files.
 // `with { type: 'file' }` returns a path (string) at runtime. Bun bundles
@@ -562,7 +569,7 @@ export function parseWithTimeout(
 }
 
 const DEFAULT_CHUNKER_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_CHUNK_TOKENS = DEFAULT_MAX_EST_TOKENS;
+const DEFAULT_CODE_MAX_CHUNK_TOKENS = DEFAULT_MAX_EST_TOKENS;
 
 function resolveChunkerTimeoutMs(): number {
   const raw = process.env.GBRAIN_CHUNKER_TIMEOUT_MS;
@@ -845,7 +852,7 @@ function capOversizedChunks(
   language: SupportedCodeLanguage,
   opts: CodeChunkOptions,
 ): CodeChunk[] {
-  const cap = opts.maxChunkTokens ?? DEFAULT_MAX_CHUNK_TOKENS;
+  const cap = opts.maxChunkTokens ?? DEFAULT_CODE_MAX_CHUNK_TOKENS;
   if (!chunks.some((c) => estimateCodeChunkTokens(c.text) > cap)) return chunks;
   const out: CodeChunk[] = [];
   for (const c of chunks) {
@@ -854,12 +861,20 @@ function capOversizedChunks(
       continue;
     }
     // Strip the structured header ("[Lang] path:N-M symbol\n\n") so the splitter
-    // works on the raw body; buildChunk re-adds a header to each piece. Reserve
-    // that header budget so the final emitted chunk, not just the body, is capped.
-    const match = c.text.match(/^(\[[^\]]+\] [^\n]+\n\n)([\s\S]*)$/);
-    const header = match ? match[1]! : '';
-    const body = match ? match[2]! : c.text;
-    const headerBudget = estimateCodeChunkTokens(header);
+    // works on the raw body; buildChunk re-adds a header to each piece. The
+    // re-added header costs tokens too — budget for it, or every piece split
+    // to exactly `cap` re-emerges a header's-worth over it (measured: a 2,000
+    // cap emitted 2,011-token fence chunks when the body alone was capped).
+    // The reservation must be an UPPER bound on the header's contribution:
+    // estimateEmbedTokens is super-additive across a mixed-script join, so the
+    // header's standalone cl100k figure under-counts ~2.5x once the body
+    // contains CJK and the weighted branch takes over (see
+    // estimateEmbedTokensCeiling).
+    const headerMatch = c.text.match(/^\[[^\]]+\] [^\n]+\n\n/);
+    const body = headerMatch ? c.text.slice(headerMatch[0].length) : c.text;
+    const headerBudget = headerMatch
+      ? Math.max(estimateEmbedTokensCeiling(headerMatch[0]), estimateEmbeddingTokens(headerMatch[0]))
+      : 0;
     const bodyCap = Math.max(1, cap - headerBudget);
     for (const piece of splitToTokenBudget(body, bodyCap, opts)) {
       if (!piece.trim()) continue;
@@ -879,26 +894,11 @@ function capOversizedChunks(
   return out;
 }
 
-/** Split `text` into pieces each estimated <= cap tokens. Word/line-aware
- *  via the shared lossless embedding-token splitter. */
+/** Split `text` into pieces each estimated <= cap tokens via the shared
+ * lossless embedding-token splitter. */
 function splitToTokenBudget(text: string, cap: number, opts: CodeChunkOptions): string[] {
   void opts;
   return capByEstimatedTokens(text, cap);
-}
-
-const CJK_CHARS_G = new RegExp(`[${CJK_SLUG_CHARS}]`, 'g');
-
-/**
- * Embedding-safe measurement for code chunks. ASCII stays bit-identical to
- * cl100k; mixed CJK uses the greater of cl100k and the conservative weighted
- * estimate so the strict-backend overflow class remains covered.
- */
-export function estimateEmbedTokens(text: string): number {
-  const cjk = (text.match(CJK_CHARS_G) || []).length;
-  if (cjk === 0) return estimateTokens(text);
-  const ws = (text.match(/\s/g) || []).length;
-  const weighted = Math.ceil(cjk + (text.length - cjk - ws) * 0.75 + ws * 0.1);
-  return Math.max(estimateTokens(text), weighted);
 }
 
 /** Strict internal cap: preserve upstream cl100k parity while retaining the
@@ -1232,54 +1232,6 @@ function normalizeSymbolType(type: string): string {
 
 function sanitize(name: string): string {
   return name.replace(/[\n\r\t]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-// v0.19.0 (Layer 5): accurate token count via @dqbd/tiktoken cl100k_base,
-// the same encoder text-embedding-3-large uses. The old len/4 heuristic was
-// 2-3x off for code. Lazy-init so dev and compiled-binary both only pay
-// the init cost once. Falls back to the heuristic if the encoder fails
-// to load (vanishingly unlikely but keeps the chunker available).
-let tiktokenEncoder: { encode: (s: string) => Uint32Array; free: () => void } | null = null;
-let tiktokenInitialized = false;
-
-// v0.20.0 Cathedral II Layer 8 (D1) — exported so commands/sync.ts can
-// estimate embed cost before a --all sync blows a surprise OpenAI bill.
-// Same cl100k_base tokenizer the embedding path actually uses, so cost
-// estimates match actual billing within tokenizer noise.
-export function estimateTokens(text: string): number {
-  if (!text) return 0;
-  if (!tiktokenInitialized) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const m = require('@dqbd/tiktoken');
-      tiktokenEncoder = m.get_encoding('cl100k_base');
-    } catch {
-      tiktokenEncoder = null;
-    }
-    tiktokenInitialized = true;
-  }
-  if (tiktokenEncoder) {
-    try {
-      return tiktokenEncoder.encode(text).length;
-    } catch {
-      // Code legitimately contains tiktoken special-token strings (e.g. CLIP/GPT
-      // tokenizers embed the literal "<|endoftext|>"). The default encode() uses
-      // disallowed_special='all' and THROWS on those, crashing reindex-code on
-      // valid source files. For a token COUNT we don't need special-token
-      // semantics: re-encode treating them as ordinary text (never throws),
-      // heuristic only if even that fails.
-      try {
-        return (
-          tiktokenEncoder as unknown as {
-            encode: (s: string, allowed: string[], disallowed: string[]) => Uint32Array;
-          }
-        ).encode(text, [], []).length;
-      } catch {
-        return Math.max(1, Math.ceil(text.length / 4));
-      }
-    }
-  }
-  return Math.max(1, Math.ceil(text.length / 4));
 }
 
 // v0.20.0 Cathedral II Layer 4: display name derived from the language
