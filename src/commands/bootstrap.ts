@@ -34,6 +34,7 @@ import { VERSION } from '../version.ts';
 import { loadConfig, loadConfigFileOnly, toEngineConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { resolveGbrainHome } from '../core/gbrain-home.ts';
+import { detectExecutionEnvironment } from '../core/execution-env.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
 import { loadQuestionBank } from '../core/bootstrap/assets.ts';
 import {
@@ -56,6 +57,7 @@ import {
   registerClaudeMcp,
   registerCodexMcp,
   writeClaudeHooks,
+  writeCommittedClaudeHooks,
   removeClaudeHooks,
 } from '../core/bootstrap/hooks.ts';
 import {
@@ -100,6 +102,10 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
   verify [--json]                 The whole install contract (round-trip, graph floor,
                                   magic moment, scans, hooks smoke). Exit 0 or not done.
   attach [--harness H]            Machine two: adopt a cloned agent workspace.
+  cloud-setup-script              Print the paste-ready cloud environment setup
+                                  script (installs the gbrain binary into the
+                                  environment snapshot; npm-based — bun fetching
+                                  is proxy-incompatible in cloud sandboxes).
   uninstall [--delete-brain] [--home <dir>] [--yes]
                                   Receipt-keyed removal. The repo stays yours.
 
@@ -242,7 +248,22 @@ function consentAnswer(ws: string, key: string): string | undefined {
   if (read.ok) {
     const a = read.state.answers[key];
     if (a?.skipped === true) return 'no';
-    if (a && a.value) return a.value;
+    // Shape-tolerant: interview.json is user-editable and readInterviewState
+    // validates only that `answers` is an object — a hand-edited unusable
+    // value (non-string, empty, or a bare {}) must never throw at a
+    // `.toLowerCase()` call site. FAIL CLOSED, loudly: falling through to a
+    // permissive bank default could flip a damaged opt-out into consent
+    // (cross-model adversarial finding); 'no' resolves every consent key to
+    // its safe reading (no hooks, no cron, project scope).
+    if (a && typeof a.value === 'string' && a.value) return a.value;
+    if (a) {
+      console.error(
+        `note: the recorded ${key} answer in state/interview.json is unusable (invalid shape) — ` +
+          'treating it as declined (fail-closed). Re-record it with `gbrain bootstrap interview` ' +
+          'if that is not what you want.',
+      );
+      return 'no';
+    }
   }
   return bank.questions[key]?.default;
 }
@@ -592,37 +613,57 @@ async function runRepo(ws: string, rest: string[], home: string, runner: ExecRun
 
     abortIfInjected('repo');
 
-    // PERSIST_CRON consent [D3 resolved]: opt-in 15-min scan-gated push job
-    // via the existing sources-harden machinery. Best-effort: a harden
-    // failure never fails the repo phase — the SessionEnd push backstop is
-    // always on.
+    // PERSIST_CRON consent [D3 resolved]: opt-in background persistence via
+    // the existing sources-harden machinery — a git post-commit auto-push plus
+    // a 30-minute scheduled pull that keeps multi-machine checkouts fresh
+    // (honest copy [D9]: the event-driven pushes do the durability work; the
+    // timer is the freshener). Best-effort: a harden failure never fails the
+    // repo phase — the per-turn and session-end pushes are always on.
     const persist = (consentAnswer(ws, 'PERSIST_CRON') ?? 'no').toLowerCase();
+    const envKind = detectExecutionEnvironment();
     if (persist === 'yes') {
       try {
         const { hardenBrainRepo } = await import('../core/brain-repo-durability.ts');
         const state = readManifest(ws);
         const sourceId = state.state === 'initialized' ? state.manifest.source_id : 'workspace';
+        // Containers/cloud sandboxes have no reliable scheduler — install the
+        // container-friendly half (post-commit hook + helper) and say so,
+        // instead of failing a crontab write that could never survive anyway.
+        const installCron = envKind === 'local';
         const report = await hardenBrainRepo({
           repoPath: ws,
           sourceId,
-          installCron: true,
+          installCron,
           verify: false,
           logger: (l: string) => process.stderr.write(`[harden] ${l}\n`),
         });
         const attention = report.steps.filter((s) => s.status === 'needs_attention');
-        console.log(
-          attention.length === 0
-            ? 'background persistence enabled (15-min scan-gated push job installed).'
-            : `background persistence partially enabled — needs attention: ${attention.map((s) => `${s.step}: ${s.detail}`).join('; ')}`,
-        );
+        if (attention.length > 0) {
+          console.log(
+            `background persistence partially enabled — needs attention: ${attention.map((s) => `${s.step}: ${s.detail}`).join('; ')}`,
+          );
+        } else if (installCron) {
+          console.log(
+            'background persistence enabled (post-commit auto-push + 30-min scheduled pull installed).',
+          );
+        } else {
+          console.log(
+            `background persistence enabled for this ${envKind === 'cloud-sandbox' ? 'cloud sandbox' : 'container'}: ` +
+              'post-commit auto-push installed; per-turn and session-end pushes are already on. ' +
+              'No scheduler exists in this environment, so the 30-min pull is skipped — run ' +
+              '`gbrain sources harden` on a persistent machine to add it.',
+          );
+        }
       } catch (e) {
         console.error(
           `note: background-persistence install failed (${(e as Error).message}). ` +
-            'Session-end pushes still persist your work; re-try later with `gbrain sources harden`.',
+            'Per-turn and session-end pushes still persist your work; re-try later with `gbrain sources harden`.',
         );
       }
     } else {
-      console.log('background persistence declined — the session-end push remains the persistence backstop.');
+      console.log(
+        'background persistence declined — the per-turn and session-end pushes remain the persistence backstop.',
+      );
     }
     return 0;
   });
@@ -665,6 +706,29 @@ async function runHooks(ws: string, rest: string[], home: string, runner: ExecRu
   }
 
   const mcpScope = ((consentAnswer(ws, 'MCP_SCOPE') ?? 'project').toLowerCase() === 'user' ? 'user' : 'project') as 'project' | 'user';
+  // A persisted 'project' answer is meaningless on Codex (`codex mcp add` has no
+  // scope flag) — reachable via attach from a Claude Code machine or a pre-fix
+  // install. Fires on each hooks/repair run while the stale answer persists.
+  // Raw read, NOT consentAnswer: the bank default is 'project', so the resolved
+  // value would fire this note on every Codex install where no one was asked.
+  if (harness === 'codex') {
+    const read = readInterviewState(ws);
+    const raw = read.ok ? read.state.answers['MCP_SCOPE'] : undefined;
+    // typeof guard: readInterviewState validates `answers` is an object but not
+    // per-answer shapes — a hand-edited value of 3 must not throw.
+    if (raw?.skipped !== true && typeof raw?.value === 'string' && raw.value.toLowerCase() === 'project') {
+      console.error(
+        "note: the recorded MCP_SCOPE answer 'project' has no effect on Codex — " +
+          '`codex mcp add` has no scope flag; the registration is user-global (any repo ' +
+          'opened on this machine can reach the brain, read and write, through its MCP tools). ' +
+          'To clear this note safely, drop the answer with `gbrain bootstrap interview --skip MCP_SCOPE`, ' +
+          'then re-confirm the read-back (`--show`, then `--confirm <hash>` — any answer change ' +
+          'invalidates the prior confirmation). Do NOT flip it to user: the answer syncs to paired ' +
+          'Claude Code machines and would widen their scope. Registration off-ramps: ' +
+          '`codex mcp remove gbrain`, or `gbrain bootstrap uninstall` (full teardown).',
+      );
+    }
+  }
   // HOOKS_CONSENT is a silent default (bank: 'yes') — hooks install unless the
   // human explicitly opts out with --no-hooks (or a persisted 'no' answer).
   const hooksConsent = !noHooks && (consentAnswer(ws, 'HOOKS_CONSENT') ?? 'yes').toLowerCase() === 'yes';
@@ -751,12 +815,28 @@ async function runHooks(ws: string, rest: string[], home: string, runner: ExecRu
     let hooksWritten = false;
     if (harness === 'claude-code') {
       if (hooksConsent) {
-        const r = writeClaudeHooks(ws, {
-          gbrainBin,
-          env: { GBRAIN_SOURCE: sourceId, ...(gbrainHome ? { GBRAIN_HOME: gbrainHome } : {}) },
-        });
+        // Carrier choice [D12]: cloud sandboxes clone fresh and snapshot hook
+        // config at session start — only the repo-COMMITTED settings file
+        // exists there, so cloud installs write the committed carrier
+        // (PATH-resolved, fail-open commands; no machine paths). Local
+        // installs keep the gitignored settings.local.json with the absolute
+        // binary path. The writers enforce that one event never fires from
+        // both files.
+        const hookEnv = { GBRAIN_SOURCE: sourceId, ...(gbrainHome ? { GBRAIN_HOME: gbrainHome } : {}) };
+        const cloudCarrier = detectExecutionEnvironment() === 'cloud-sandbox';
+        const r = cloudCarrier
+          ? writeCommittedClaudeHooks(ws, { env: hookEnv })
+          : writeClaudeHooks(ws, { gbrainBin, env: hookEnv });
         hooksWritten = true;
-        console.log(`hooks installed (${r.installed.length} event(s)) in ${r.settingsPath}${repair ? ' [repair]' : ''} — your brain now loads every turn. Turn off any time with GBRAIN_HOOKS=0, or re-run with --no-hooks.`);
+        console.log(
+          `hooks installed (${r.installed.length} event(s)) in ${r.settingsPath}${repair ? ' [repair]' : ''} — your brain now loads every turn. Turn off any time with GBRAIN_HOOKS=0, or re-run with --no-hooks.`,
+        );
+        if (cloudCarrier) {
+          console.log(
+            'cloud sandbox: hooks written to the COMMITTED .claude/settings.json (fail-open, PATH-resolved) — ' +
+              'commit + push it so the next session starts with hooks live; hooks written mid-session activate on the NEXT session (startup snapshot).',
+          );
+        }
         for (const note of r.notes) console.error(note);
       } else {
         console.log(
@@ -875,6 +955,10 @@ async function runUninstall(ws: string, rest: string[], home: string, runner: Ex
         'offered: export facts before deletion (`gbrain facts export`) — the brain DB is about to be removed and facts are not derived state',
       );
     }
+    // Read the source id BEFORE uninstallWorkspace removes rendered files —
+    // the durability teardown below needs it and the manifest may not survive.
+    const preState = readManifest(ws);
+    const durabilitySourceId = preState.state === 'initialized' ? preState.manifest.source_id : 'workspace';
     const result = await uninstallWorkspace(ws, {
       deleteBrain,
       ...(yes ? { confirm: async () => true } : {}),
@@ -895,6 +979,41 @@ async function runUninstall(ws: string, rest: string[], home: string, runner: Ex
         const rm = await runner(['codex', 'mcp', 'remove', 'gbrain']);
         if (rm.code !== 0) console.error('note: `codex mcp remove gbrain` did not succeed — remove it by hand if it lingers.');
       }
+    }
+
+    // Per-root hook-lane state [D13]: remove this workspace's push-status,
+    // debounce, and announce files — a dead root's failing record would
+    // otherwise re-fire the failure banner forever (it can never be cleared
+    // by a re-push once the workspace is gone).
+    try {
+      const { pushStatusPathForRoot, workspaceRootHash } = await import('../core/workspace-push.ts');
+      const { execFileSync } = await import('node:child_process');
+      let root = ws;
+      try {
+        root = execFileSync('git', ['-C', ws, 'rev-parse', '--show-toplevel'], {
+          stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000, env: process.env,
+        }).toString().trim() || ws;
+      } catch { /* not a repo — use ws as-is */ }
+      const { rmSync } = await import('node:fs');
+      const statusFile = pushStatusPathForRoot(root);
+      for (const f of [statusFile, `${statusFile}.announced`, join(resolveGbrainHome(), 'bootstrap', `stop-push-${workspaceRootHash(root)}.json`)]) {
+        rmSync(f, { force: true });
+      }
+    } catch { /* best-effort */ }
+
+    // Durability teardown [B6]: uninstall previously left the launchd/cron
+    // job, the untracked post-commit hook, and the credential wiring behind.
+    // Best-effort — a teardown hiccup never fails the uninstall. The COMMITTED
+    // helper script and AGENTS.md rules stay (repo content is the user's).
+    try {
+      const { unhardenBrainRepo } = await import('../core/brain-repo-durability.ts');
+      const steps = await unhardenBrainRepo({ repoPath: ws, sourceId: durabilitySourceId });
+      const acted = steps.filter((s) => s.status === 'fixed');
+      if (acted.length > 0) {
+        console.log(`durability wiring removed: ${acted.map((s) => s.step).join(', ')} (committed helper + AGENTS rules stay — repo content is yours)`);
+      }
+    } catch (e) {
+      console.error(`note: durability teardown incomplete (${(e as Error).message}) — run \`gbrain sources unharden ${durabilitySourceId}\` by hand if a scheduled job lingers.`);
     }
 
     // The facts-export offer already printed BEFORE deletion (above); don't
@@ -934,7 +1053,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
   const logCtx: LogCtx = { home, ws, ...(harnessForLog ? { harness: harnessForLog } : {}) };
   const t0 = Date.now();
 
-  const KNOWN = new Set(['status', 'interview', 'render', 'repo', 'hooks', 'verify', 'attach', 'uninstall']);
+  const KNOWN = new Set(['status', 'interview', 'render', 'repo', 'hooks', 'verify', 'attach', 'uninstall', 'cloud-setup-script']);
   if (!KNOWN.has(sub)) {
     console.error(`unknown subcommand: ${sub}`);
     console.error(BOOTSTRAP_HELP);
@@ -951,6 +1070,13 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
       case 'status':
         // status is the read surface — it does not log itself into install.jsonl.
         return await runStatus(ws, rest, home);
+      case 'cloud-setup-script': {
+        // Pure print [D16]: the paste-ready cloud environment setup script.
+        // Read surface like status — no install log entry.
+        const { loadCloudSetupScript } = await import('../core/bootstrap/assets.ts');
+        console.log(loadCloudSetupScript().trimEnd());
+        return 0;
+      }
       case 'interview':
         code = await runInterview(ws, rest);
         break;

@@ -1,4 +1,4 @@
-<!-- gbrain-runbook-stamp: 0.45.2.0 -->
+<!-- gbrain-runbook-stamp: 0.45.9.0 -->
 <!-- This stamp must equal the VERSION file at every release; CI enforces it
      (scripts/check-bootstrap-tag.sh). `gbrain bootstrap status` compares it to
      the installed binary and warns on skew. -->
@@ -50,7 +50,17 @@ platform package manager first (`brew install gh`, `apt install gh`, `dnf instal
 `winget install GitHub.cli` per the official instructions); never a piped
 curl-to-shell one-liner. Install gbrain ONLY as
 `bun install -g github:garrytan/gbrain#latest-stable` — the npm package named
-"gbrain" is an unrelated project.
+"gbrain" is an unrelated project. (Cloud-sandbox exception: bun's package fetching
+is proxy-incompatible there — use the `gbrain bootstrap cloud-setup-script` recipe,
+which installs from the same pinned GitHub source through npm.)
+
+⛔ **NEVER FABRICATE TOOLING.** If gh or any preflight binary is missing, blocked
+by a sandbox egress proxy, or answering 403s, report that through
+`status`/`doctor` output and follow the cloud-sandbox guidance below. Never
+hand-roll a gh shim, stub a fake binary into /usr/local/bin, or fake a passing
+check — a fabricated tool poisons every later verification, and the one time it
+was tried it masked a real silent-persistence failure. The CLI degrades honestly
+on its own; your job is to relay, not to bridge.
 
 ## Codex preflight (ChatGPT desktop / Codex CLI only)
 
@@ -83,6 +93,15 @@ you needed; report the count at the end (it feeds the install-time measurement).
 3. **Interview.** `gbrain bootstrap interview --init`, then ask the questions from
    the bank (the CLI prints them) in three batches, recording each answer verbatim
    with `--set KEY "value"`. Push once on vague answers to the required questions.
+   Claude Code only: with the final batch, also ask the ONE operational consent —
+   MCP scope. It is not one of the 12 interview questions; consents ride alongside
+   the bank. The choice: project (recommended — any other repo you open cannot
+   read your brain) vs user (your agent everywhere, but any repo you open can
+   reach it — read and write — and two open sessions contend for the database).
+   Record it with
+   `gbrain bootstrap interview --set MCP_SCOPE <project|user>` BEFORE the
+   read-back, so the confirmation covers it. On Codex, skip this question
+   entirely — the wiring step states the Codex reality instead.
    After the last batch: read ALL answers back in one compact block, ask "Is this
    the thing you want in the room?", and only then run
    `gbrain bootstrap interview --confirm <hash>` with the hash `--status` printed
@@ -96,12 +115,15 @@ you needed; report the count at the end (it feeds the install-time measurement).
    - Claude Code: installs per-turn hooks ON by default — do NOT ask; loading the
      brain every turn is the whole point of installing gbrain for your agent. Tell
      the human it is on and how to turn it off (`GBRAIN_HOOKS=0`, or re-run with
-     `--no-hooks`, or `gbrain bootstrap uninstall`). The ONE consent to actually
-     ask in this phase is MCP scope: project (recommended — any other repo you open
-     cannot read your brain) vs user (your agent everywhere, but any repo you open
-     can query it, and two open sessions contend for the database).
+     `--no-hooks`, or `gbrain bootstrap uninstall`). MCP scope is NOT asked here —
+     `hooks` consumes the MCP_SCOPE answer recorded during the interview.
    - Codex: registers MCP (`codex mcp add`) and relies on the AGENTS.md protocol —
      say plainly that Codex gets pull-based context, not per-turn push.
+     Do NOT offer an MCP scope choice: `codex mcp add` has no scope flag, so
+     the registration is always user-global. State it as fact — any repo opened
+     on this machine can reach the brain (read and write) through its MCP
+     tools; the off-ramps are `codex mcp remove gbrain` (registration only) or
+     `gbrain bootstrap uninstall` (full teardown).
 7. **Private repo.** `gbrain bootstrap repo` — creates a PRIVATE GitHub repo from
    the workspace, verifies the privacy bit through the API, pushes. If the human
    started from a repo they created themselves (create-repo-first: an EMPTY private
@@ -109,8 +131,9 @@ you needed; report the count at the end (it feeds the install-time measurement).
    instead of creating one — verifies it is private and pushes the workspace. A
    non-empty repo, or one owned by an org, is refused with a clear message (make an
    empty personal repo, or run `gbrain bootstrap attach` for an existing agent
-   clone). Asks the background-persistence consent (15-minute scan-gated push job;
-   declining still persists at session end). If the human has no GitHub or declines:
+   clone). Asks the background-persistence consent (a git post-commit auto-push
+   plus a 30-minute pull job for multi-machine freshness; declining still persists
+   via the per-turn and session-end pushes). If the human has no GitHub or declines:
    local-only mode with an honest warning; `bootstrap repo` can run any time later.
    Note: the per-turn/session push stays deferred until this phase records the
    verified repo, so nothing is ever pushed to an unverified-privacy origin.
@@ -127,6 +150,42 @@ initialized), run `gbrain bootstrap attach` instead of the interview/render/repo
 phases — it wires this machine (source, hooks, MCP) and verifies. If agent.json
 says it is an uninitialized template, proceed with the normal flow from phase 1.
 
+## Cloud sandboxes (claude.ai/code and similar proxied environments)
+
+**How you know:** `gbrain bootstrap status --json` reports
+`execution_environment: "cloud-sandbox"` (the CLI detects the documented
+signals — the CLAUDE_CODE_REMOTE env var, the proxy-injected token
+placeholder). Trust the CLI's detection over your own guesses.
+
+**Expected degradations — these are facts to relay, not bugs to bridge:**
+
+- **No crontab, no surviving background processes.** The VM is reclaimed after
+  inactivity. The scheduled pull is skipped honestly; the per-turn (Stop hook)
+  and session-end pushes carry persistence. Decline nothing, fabricate nothing.
+- **GitHub GraphQL is always blocked** by the egress proxy, and **REST reaches
+  only repos attached to the session** — a repo created mid-session is NOT
+  attached, so `gbrain bootstrap repo` refuses fast in cloud with the flow
+  that works. Privacy verification falls back to pure git protocol on its own.
+- **`git push` works only against the session's working branch.** A user PAT
+  does not bypass any of this.
+- **Only repo-committed files carry into the next session.** `~/.gbrain`,
+  `~/.claude`, and the gitignored `.claude/settings.local.json` evaporate.
+  Hooks therefore live in the COMMITTED `.claude/settings.json` (the CLI
+  writes PATH-resolved, fail-open commands there in cloud); hook config is
+  snapshotted at session start, so hooks written mid-session activate on the
+  NEXT session — say so instead of debugging it.
+
+**The correct cloud flow:**
+
+1. The human creates the private repo from a normal machine (or github.com)
+   and opens the cloud session ON that repo.
+2. The environment's setup script installs the gbrain binary — print it with
+   `gbrain bootstrap cloud-setup-script` and have the human paste it into the
+   environment config (npm-based; bun's fetching is proxy-incompatible there).
+3. Inside the session: `gbrain bootstrap attach`, then
+   `gbrain bootstrap hooks --harness claude-code` (writes the committed
+   carrier), commit + push, and tell the human the hooks go live next session.
+
 ## Failure modes, and what they actually mean
 
 | Symptom | Real cause | Fix |
@@ -138,6 +197,9 @@ says it is an uninitialized template, proceed with the normal flow from phase 1.
 | "bootstrap already running (pid N)" | A concurrent bootstrap holds the lock | Wait or investigate that pid; the lock self-clears when stale. |
 | Brain tools fail with a lock error | Another live session's serve owns the database | Close the other session; sequential use is the v1 contract. |
 | Hook reports "brain context unavailable" | serve not running or degraded | `gbrain doctor` names it; hooks fail open by design. |
+| gh answers 403 "not enabled for this session" | Cloud proxy scoping — the repo is not attached to the session | Expected in cloud; the visibility ladder falls back to git protocol. NEVER shim gh. |
+| "crontab: command not found" / cron skipped | Containers and cloud sandboxes ship without a scheduler | Expected; event-driven pushes cover it — the skip message says exactly this. |
+| A turn shows "workspace push is FAILING" | The background push is refusing (visibility, secret-scan, or network reasons) | Run `gbrain doctor`; the banner repeats every 30 min until fixed. |
 
 ## Hand off
 

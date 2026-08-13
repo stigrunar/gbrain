@@ -14,6 +14,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -197,6 +198,170 @@ describe('per-turn hooks are ON by default (v0.45 flip); --no-hooks opts out', (
     expect(out.out).toContain('--no-hooks');
     expect(existsSync(join(fws, '.claude', 'settings.local.json'))).toBe(false);
     expect(calls.some((argv) => argv[0] === 'claude' && argv[1] === 'mcp' && argv[2] === 'add')).toBe(true);
+    expect(readReceipt(fhome)?.registrations).toEqual([{ host: 'claude-code', scope: 'project', detail: 'mcp' }]);
+  }, 30_000);
+});
+
+describe('codex scope-note guard — Codex has no scope flag; stale MCP_SCOPE answers', () => {
+  // Full branch matrix on the runHooks codex note: it must fire ONLY for an
+  // explicit, non-skipped, string-valued 'project' answer (raw state read — the
+  // consentAnswer resolver would default unset → 'project' and fire the note on
+  // every Codex install where no one was ever asked).
+  const NOTE = 'no effect on Codex';
+  const scratch: string[] = [];
+  afterAll(() => {
+    for (const d of scratch) rmSync(d, { recursive: true, force: true });
+  });
+
+  function scopeWorkspace(mcpScope: 'project' | 'user' | 'skip' | 'unset'): {
+    fws: string;
+    fhome: string;
+    fparent: string;
+  } {
+    const fparent = mkdtempSync(join(tmpdir(), 'gb-scope-'));
+    const fhome = join(fparent, '.gbrain');
+    mkdirSync(fhome, { recursive: true });
+    const fws = mkdtempSync(join(tmpdir(), 'gb-scope-ws-'));
+    scratch.push(fparent, fws);
+    const prev = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = fparent;
+    try {
+      expect(initState(fws).ok).toBe(true);
+      for (const [key, value] of Object.entries(REQUIRED_ANSWERS)) {
+        const r = setAnswer(fws, key, value);
+        if (!r.ok) throw new Error(r.message);
+      }
+      if (mcpScope === 'skip') expect(skipAnswer(fws, 'MCP_SCOPE').ok).toBe(true);
+      else if (mcpScope !== 'unset') expect(setAnswer(fws, 'MCP_SCOPE', mcpScope).ok).toBe(true);
+      const h = readBackHash(fws);
+      if (!h.ok) throw new Error(h.message);
+      expect(confirm(fws, h.hash).ok).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = prev;
+    }
+    return { fws, fhome, fparent };
+  }
+
+  async function withScopeHome<T>(parent: string, fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = parent;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = prev;
+    }
+  }
+
+  async function renderThenHooks(
+    fws: string,
+    fparent: string,
+    harness: 'codex' | 'claude-code',
+    mutateAfterRender?: () => void,
+  ) {
+    return withScopeHome(fparent, async () => {
+      expect((await capture(() => runBootstrap(['render', '--workspace', fws]))).result).toBe(0);
+      mutateAfterRender?.();
+      const { runner } = makeRunner();
+      return capture(() =>
+        runBootstrap(['hooks', '--workspace', fws, '--harness', harness, '--gbrain-bin', process.execPath], {
+          runner,
+        }),
+      );
+    });
+  }
+
+  test('codex + explicit project → note fires; hooks skipped; receipt records user scope', async () => {
+    const { fws, fhome, fparent } = scopeWorkspace('project');
+    const r = await renderThenHooks(fws, fparent, 'codex');
+    expect(r.result).toBe(0);
+    expect(r.err).toContain(NOTE);
+    expect(r.err).toContain('user-global');
+    expect(existsSync(join(fws, '.claude', 'settings.local.json'))).toBe(false);
+    expect(readReceipt(fhome)?.registrations).toEqual([{ host: 'codex', scope: 'user', detail: 'mcp' }]);
+  }, 30_000);
+
+  test('codex + unset → NO note (raw read, not the project-defaulting resolver)', async () => {
+    const { fws, fparent } = scopeWorkspace('unset');
+    const r = await renderThenHooks(fws, fparent, 'codex');
+    expect(r.result).toBe(0);
+    expect(r.err).not.toContain(NOTE);
+  }, 30_000);
+
+  test('codex + explicitly skipped → NO note (skipped is not an answer)', async () => {
+    const { fws, fparent } = scopeWorkspace('skip');
+    const r = await renderThenHooks(fws, fparent, 'codex');
+    expect(r.result).toBe(0);
+    expect(r.err).not.toContain(NOTE);
+  }, 30_000);
+
+  test('codex + explicit user → NO note (nothing to correct)', async () => {
+    const { fws, fparent } = scopeWorkspace('user');
+    const r = await renderThenHooks(fws, fparent, 'codex');
+    expect(r.result).toBe(0);
+    expect(r.err).not.toContain(NOTE);
+  }, 30_000);
+
+  test('claude-code + explicit project → NO note (harness guard); hooks flow unchanged', async () => {
+    const { fws, fhome, fparent } = scopeWorkspace('project');
+    const r = await renderThenHooks(fws, fparent, 'claude-code');
+    expect(r.result).toBe(0);
+    expect(r.err).not.toContain(NOTE);
+    expect(readReceipt(fhome)?.registrations).toEqual([{ host: 'claude-code', scope: 'project', detail: 'mcp+hooks' }]);
+  }, 30_000);
+
+  test('codex + corrupt interview.json → NO note, exit 0 (fail-open read.ok route)', async () => {
+    const { fws, fparent } = scopeWorkspace('project');
+    const r = await renderThenHooks(fws, fparent, 'codex', () => {
+      writeFileSync(join(fws, 'state', 'interview.json'), '{ not json', 'utf8');
+    });
+    expect(r.result).toBe(0);
+    expect(r.err).not.toContain(NOTE);
+  }, 30_000);
+
+  test('codex + malformed answer shape (value: 3) → NO note, no crash (typeof guard)', async () => {
+    const { fws, fparent } = scopeWorkspace('unset');
+    const r = await renderThenHooks(fws, fparent, 'codex', () => {
+      const p = join(fws, 'state', 'interview.json');
+      const state = JSON.parse(readFileSync(p, 'utf8')) as { answers: Record<string, unknown> };
+      state.answers['MCP_SCOPE'] = { value: 3 };
+      writeFileSync(p, JSON.stringify(state), 'utf8');
+    });
+    expect(r.result).toBe(0);
+    expect(r.err).not.toContain(NOTE);
+  }, 30_000);
+
+  test('claude-code + malformed answer shape → consentAnswer falls to bank default; hooks flow completes', async () => {
+    const { fws, fhome, fparent } = scopeWorkspace('unset');
+    const r = await renderThenHooks(fws, fparent, 'claude-code', () => {
+      const p = join(fws, 'state', 'interview.json');
+      const state = JSON.parse(readFileSync(p, 'utf8')) as { answers: Record<string, unknown> };
+      state.answers['MCP_SCOPE'] = { value: 3 };
+      writeFileSync(p, JSON.stringify(state), 'utf8');
+    });
+    expect(r.result).toBe(0);
+    // Pre-fix this crashed at mcpScope's .toLowerCase(); now the unusable
+    // value fails CLOSED ('no' → project scope) — LOUDLY (a silent fall-through
+    // could flip a damaged opt-out to consent).
+    expect(r.err).toContain('invalid shape');
+    expect(readReceipt(fhome)?.registrations).toEqual([{ host: 'claude-code', scope: 'project', detail: 'mcp+hooks' }]);
+  }, 30_000);
+
+  test('claude-code + malformed HOOKS_CONSENT → fail-closed: hooks DECLINED, note printed', async () => {
+    const { fws, fhome, fparent } = scopeWorkspace('unset');
+    const r = await renderThenHooks(fws, fparent, 'claude-code', () => {
+      const p = join(fws, 'state', 'interview.json');
+      const state = JSON.parse(readFileSync(p, 'utf8')) as { answers: Record<string, unknown> };
+      // A merge-damaged boolean: previously crashed; a bank-default fall-through
+      // would silently flip a possible opt-out to consent-granted. Fail closed.
+      state.answers['HOOKS_CONSENT'] = { value: true };
+      writeFileSync(p, JSON.stringify(state), 'utf8');
+    });
+    expect(r.result).toBe(0);
+    expect(r.err).toContain('invalid shape');
+    expect(r.out).toContain('hooks declined');
+    expect(existsSync(join(fws, '.claude', 'settings.local.json'))).toBe(false);
     expect(readReceipt(fhome)?.registrations).toEqual([{ host: 'claude-code', scope: 'project', detail: 'mcp' }]);
   }, 30_000);
 });
@@ -390,11 +555,15 @@ describe('uninstall --delete-brain ordering + engine-free stats', () => {
     }
   });
 
-  test('facts-export offer prints BEFORE deletion output; brain deleted via isolated --home', async () => {
+  test('facts-export offer prints BEFORE deletion output; brain deleted via isolated --home; durability wiring torn down [B6]', async () => {
     // Isolated-style home INSIDE the workspace (the S3#5 shape --home requires
     // while GBRAIN_HOME is set): config.json + brain.pglite signature + receipt.
     const ws2 = mkdtempSync(join(tmpdir(), 'gb-dispatch-ws2-'));
     const isoHome = join(ws2, '.gbrain');
+    // HOME redirected for the plist/crontab teardown probes — the real
+    // machine's LaunchAgents must never be touched by a test.
+    const savedHome = process.env.HOME;
+    process.env.HOME = mkdtempSync(join(tmpdir(), 'gb-dispatch-home-'));
     try {
       mkdirSync(join(isoHome, 'brain.pglite'), { recursive: true });
       mkdirSync(join(isoHome, 'bootstrap'), { recursive: true });
@@ -414,6 +583,16 @@ describe('uninstall --delete-brain ordering + engine-free stats', () => {
       writeFileSync(receiptPath(isoHome), JSON.stringify(receipt), 'utf8');
       mkdirSync(join(ws2, 'brain'), { recursive: true });
       writeFileSync(join(ws2, 'brain', 'page.md'), '# page', 'utf8');
+      // Durability wiring fixture [B6]: a gbrain post-commit hook that
+      // uninstall previously left behind.
+      execFileSync('git', ['init', '-q'], { cwd: ws2 });
+      const hookPath = join(ws2, '.git', 'hooks', 'post-commit');
+      mkdirSync(join(ws2, '.git', 'hooks'), { recursive: true });
+      writeFileSync(
+        hookPath,
+        '#!/bin/bash\n# gbrain brain-durability post-commit hook (v0.42.44+)\nexit 0\n',
+        { mode: 0o755 },
+      );
 
       const r = await capture(() =>
         runBootstrap(['uninstall', '--workspace', ws2, '--delete-brain', '--yes', '--home', isoHome]),
@@ -426,8 +605,30 @@ describe('uninstall --delete-brain ordering + engine-free stats', () => {
       // The offer is printed exactly once (not repeated from the module steps).
       expect(r.out.indexOf('offered: export facts', offerIdx + 1)).toBe(-1);
       expect(existsSync(join(isoHome, 'brain.pglite'))).toBe(false);
+      // [B6] the untracked post-commit hook is gone and the teardown said so.
+      expect(existsSync(hookPath)).toBe(false);
+      expect(r.out).toContain('durability wiring removed');
     } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
       rmSync(ws2, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+describe('cloud-setup-script emitter [D16]', () => {
+  test('prints the paste-ready script: npm-based (never bun fetching, never the npm squatter), launcher + attach flow', async () => {
+    const r = await capture(() => runBootstrap(['cloud-setup-script']));
+    expect(r.result).toBe(0);
+    const s = r.out;
+    // npm transport (bun fetching is proxy-incompatible in cloud sandboxes)…
+    expect(s).toContain('npm install -g bun');
+    expect(s).toContain('github.com/garrytan/gbrain');
+    // …but NEVER the unrelated npm registry package.
+    expect(s).not.toMatch(/npm install -g gbrain(\s|$)/m);
+    // PATH-resolved launcher + in-session follow-ups.
+    expect(s).toContain('/usr/local/bin/gbrain');
+    expect(s).toContain('bootstrap attach');
+    expect(s).toContain('cloud-setup-script');
+  });
 });

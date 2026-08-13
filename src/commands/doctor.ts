@@ -12,6 +12,9 @@ import {
   type SkillsManifest,
 } from '../core/skills-integrity.ts';
 import { loadOrDeriveManifest } from '../core/skill-manifest.ts';
+import { computeSkillCurrency } from '../core/skillpack/skill-currency.ts';
+import { findGbrainRoot } from '../core/skillpack/bundle.ts';
+import { checkPreconditions, type PreconditionContext } from '../core/skillpack/preconditions.ts';
 import { parseSkillFrontmatter } from '../core/skill-frontmatter.ts';
 import {
   analyzeSkillBrainFirst,
@@ -48,7 +51,8 @@ import {
 import { probeSourceGitState } from '../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
-import { lagFromContentMs } from '../core/source-health.ts';
+import { lagFromContentMs, resolveStalenessCeilingSeconds } from '../core/source-health.ts';
+import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../core/env-number.ts';
 import { CHUNKER_VERSION } from '../core/chunkers/code.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../core/link-extraction.ts';
 import { isUndefinedColumnError } from '../core/utils.ts';
@@ -3322,10 +3326,6 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
 const checkSubagentProvider = checkSubagentCapability;
 void checkSubagentProvider;
 
-// Module-scoped set so each invalid-env-var warning fires once per process,
-// per variable name (v0.42.7 #1696: was a single bool shared across all vars).
-const _envNumberWarned = new Set<string>();
-
 /**
  * v0.42.7 (#1696): single source of truth for the extraction-lag warn
  * threshold (percent). Both the `links_extraction_lag` doctor check AND the
@@ -3339,31 +3339,19 @@ export const EXTRACTION_LAG_WARN_PCT_DEFAULT = 20;
 export const EXTRACTION_LAG_MIN_PAGES = 100;
 
 /**
- * v0.42.7 (#1696, C1): generic "read a positive number from an env var, warn
- * once + fall back on garbage." Extracted from _resolveSyncFreshnessHours so
- * the percent-threshold doctor checks don't reuse a `...Hours`-named helper.
- * `opts.unit` is purely cosmetic for the warning string ('h', '%', '').
- * Exported (D3) so the sync nudge resolves the threshold the same way.
+ * Re-exported from `src/core/env-number.ts`, which now owns the implementation
+ * AND the warn-once memo. `source-health.ts` needs the hours resolver for the
+ * staleness ceiling, and doctor already imports from source-health — so the
+ * helper had to move to core or the import graph would cycle.
+ *
+ * The `_resolveEnvNumber` name is kept because `sync.ts:5730` dynamically
+ * imports it from this module.
  */
-export function _resolveEnvNumber(varName: string, fallback: number, opts?: { unit?: string }): number {
-  const raw = process.env[varName];
-  if (raw === undefined || raw === '') return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
-    if (!_envNumberWarned.has(varName)) {
-      _envNumberWarned.add(varName);
-      console.warn(
-        `[gbrain doctor] Ignoring invalid ${varName}=${raw}; using default ${fallback}${opts?.unit ?? ''}.`,
-      );
-    }
-    return fallback;
-  }
-  return n;
-}
+export { resolveEnvNumber as _resolveEnvNumber };
 
-function _resolveSyncFreshnessHours(varName: string, fallback: number): number {
-  return _resolveEnvNumber(varName, fallback, { unit: 'h' });
-}
+/** Local aliases; the shared memo lives in core so it can't fork per module. */
+const _resolveEnvNumber = resolveEnvNumber;
+const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 /**
  * Sync freshness check (v0.32.4) — verify that sources with local_path have
@@ -3757,9 +3745,11 @@ export async function checkLinksExtractionLag(
       const n = Number(failRaw);
       if (Number.isFinite(n) && n > 0) {
         failPct = n;
-      } else if (!_envNumberWarned.has('GBRAIN_EXTRACTION_LAG_FAIL_PCT')) {
-        _envNumberWarned.add('GBRAIN_EXTRACTION_LAG_FAIL_PCT');
-        console.warn(`[gbrain doctor] Ignoring invalid GBRAIN_EXTRACTION_LAG_FAIL_PCT=${failRaw}; hard-fail stays disabled.`);
+      } else {
+        warnOnceForEnv(
+          'GBRAIN_EXTRACTION_LAG_FAIL_PCT',
+          `[gbrain] Ignoring invalid GBRAIN_EXTRACTION_LAG_FAIL_PCT=${failRaw}; hard-fail stays disabled.`,
+        );
       }
     }
 
@@ -4349,7 +4339,7 @@ export async function checkSyncFreshness(
     // bucket). Empty when nothing is syncing — keeps the steady-state messages
     // byte-for-byte unchanged.
     const inProgress: string[] = [];
-    let liveSyncSnap: (sourceId: string) => Promise<{ holder_pid: number; holder_host: string } | null> =
+    let liveSyncSnap: (sourceId: string) => Promise<{ holder_pid: number; holder_host: string; age_ms: number } | null> =
       async () => null;
     try {
       const { inspectLock, syncLockId } = await import('../core/db-lock.ts');
@@ -4357,7 +4347,7 @@ export async function checkSyncFreshness(
         try {
           const snap = await inspectLock(engine, syncLockId(sourceId));
           return snap && !snap.ttl_expired
-            ? { holder_pid: snap.holder_pid, holder_host: snap.holder_host }
+            ? { holder_pid: snap.holder_pid, holder_host: snap.holder_host, age_ms: snap.age_ms }
             : null;
         } catch {
           return null;
@@ -4367,6 +4357,10 @@ export async function checkSyncFreshness(
       /* db-lock unavailable — skip in-progress detection, staleness stands. */
     }
 
+    // One ceiling for the whole report: hoisted out of the loop so every
+    // source is judged against the same number (and the env read + warn-once
+    // machinery runs once, not once per source).
+    const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
     for (const source of sources) {
       // Embed source.id in user-visible messages so `gbrain sync --source <id>`
       // matches what the user copy-pastes. Show display name in parens when set.
@@ -4376,10 +4370,35 @@ export async function checkSyncFreshness(
 
       // BUG 4: actively syncing (live lock) → healthy, count as synced_recently
       // and skip the staleness checks. Keeps the 3-bucket invariant intact.
+      //
+      // ...but ONLY up to the staleness ceiling. `withRefreshingLock` bumps the
+      // heartbeat on its own timer regardless of whether the import is making
+      // forward progress (`liveSyncStatus`'s docstring is explicit: callers may
+      // report "running", NOT "healthy"). So a holder blocked inside a query
+      // keeps refreshing forever, and an uncapped in-progress verdict would
+      // mask that source from every staleness check indefinitely — the same
+      // invisible-failure class this whole pass exists to close, just reached
+      // through the lock table instead of the freshness column.
       const liveSnap = await liveSyncSnap(source.id);
       if (liveSnap) {
-        inProgress.push(`${display} sync in progress (pid ${liveSnap.holder_pid} on ${liveSnap.holder_host})`);
-        synced_recently_count++;
+        const ceilingMs = stalenessCeilingSeconds * 1000;
+        if (liveSnap.age_ms <= ceilingMs) {
+          inProgress.push(`${display} sync in progress (pid ${liveSnap.holder_pid} on ${liveSnap.holder_host})`);
+          synced_recently_count++;
+          continue;
+        }
+        // Sub-hour ceilings are legal (fractional env override), and an alarm
+        // that names a zero duration ("held the lock for 0h") reads as broken.
+        const heldFor = liveSnap.age_ms >= 3600_000
+          ? `${Math.floor(liveSnap.age_ms / 3600_000)}h`
+          : `${Math.max(1, Math.floor(liveSnap.age_ms / 60_000))}m`;
+        issues.push(
+          `Source ${display} has held the sync lock for ${heldFor} ` +
+          `(pid ${liveSnap.holder_pid} on ${liveSnap.holder_host}) — heartbeating but not finishing. ` +
+          `Run \`gbrain sync --break-lock --source ${source.id}\` after confirming the holder is wedged.`,
+        );
+        hasFailures = true;
+        stale_count++;
         continue;
       }
 
@@ -4468,6 +4487,7 @@ export async function checkSyncFreshness(
           contentMs !== null && Number.isFinite(contentMs) ? contentMs : null,
           lastSync,
           now,
+          stalenessCeilingSeconds,
         );
         thresholdAgeMs = lagSec === null ? ageMs : lagSec * 1000;
       }
@@ -5353,6 +5373,15 @@ export async function buildChecks(
     checks.push(skillsManifestIntegrityCheck(skillsDir));
   }
 
+  // 2c-bis. Skill currency (new built-in skills available downstream) +
+  // live precondition verification for installed skills that declare
+  // `requires:`. Currency is filesystem-only; preconditions need the engine
+  // and skip cleanly without one.
+  if (scope === 'all' && skillsDir) {
+    checks.push(skillCurrencyCheck(skillsDir));
+    checks.push(await skillPreconditionsCheck(skillsDir, engine));
+  }
+
   // 2d. Agent-bootstrap health (plan B2/B4/ENG-4). Filesystem-first; the
   // one engine-dependent pairing check degrades gracefully when engine is
   // null. Emits NOTHING on machines with no bootstrap state, so ordinary
@@ -6150,6 +6179,44 @@ export async function buildChecks(
     }
   } catch {
     // Best-effort environment check; never block doctor.
+  }
+
+  // 3g. pglite_leftovers (#3856). A pglite -> postgres migration leaves the
+  // old engine store (`brain.pglite/`) under the gbrain home forever — dead
+  // weight roughly the size of the live DB that nothing surfaces, silently
+  // riding along in any backup that archives the home dir. Assessment is a
+  // pure helper (src/core/pglite-leftovers-check.ts); it warns ONLY for a
+  // durable postgres engine, and skips while `migrate-manifest.json` exists
+  // (an in-flight/interrupted migration can make `brain.pglite` the LIVE
+  // target while the durable engine still reads postgres — #3194) and for
+  // everything else (fail open).
+  // The engine is read from config.json DIRECTLY, not loadConfig(): a
+  // transient DATABASE_URL (#427) can make a live PGLite brain resolve as
+  // postgres for one process, and deletion advice must never rest on an
+  // env override (Codex review P1).
+  // Warn-only by design: WHEN the abandoned store is safe to drop is a
+  // policy question (#3856), so the remediation is a verified manual delete
+  // — no CLI command is named that does not exist (#3697).
+  try {
+    const { readFileSync } = await import('node:fs');
+    const durableEngine = (
+      JSON.parse(readFileSync(join(gbrainPath(), 'config.json'), 'utf8')) as { engine?: unknown }
+    ).engine;
+    const { assessPgliteLeftovers } = await import('../core/pglite-leftovers-check.ts');
+    const leftovers = assessPgliteLeftovers(
+      typeof durableEngine === 'string' ? durableEngine : undefined,
+      gbrainPath(),
+    );
+    if (leftovers.status !== 'skip') {
+      checks.push({
+        name: 'pglite_leftovers',
+        status: leftovers.status,
+        message: leftovers.message,
+      });
+    }
+  } catch {
+    // Best-effort filesystem-hygiene check; never block doctor (a missing/
+    // unparseable config.json lands here and skips, same fail-open posture).
   }
 
   // 3b-multi-source. Multi-source drift (v0.31.8 — D8 + D17 + OV12 + OV13).
@@ -8342,9 +8409,12 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
     return [];
   }
   const receipt = readReceipt(home);
-  const pushStatusFile = join(home, 'bootstrap', 'push-status.json');
+  // One reader for every push-status surface [D8]; per-root files [D13].
+  const { readPushStatuses, pushStatusFilesExist } = await import('../core/workspace-push.ts');
+  const pushStatuses = readPushStatuses();
+  const statusFilesOnDisk = pushStatusFilesExist();
   const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
-  const hasBootstrapState = receipt !== null || existsSync(pushStatusFile) || existsSync(heartbeatFile);
+  const hasBootstrapState = receipt !== null || statusFilesOnDisk || existsSync(heartbeatFile);
   if (!hasBootstrapState) return [];
 
   const ws = receipt?.workspace_dir ?? null;
@@ -8385,42 +8455,123 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   }
 
   // 2. Push staleness [B4]: fail when the last successful push is >48h old
-  // AND the workspace tree is dirty (recent work provably unpushed).
+  // AND the workspace tree is dirty (recent work provably unpushed). Per-root
+  // status files [D13]: the WORST entry decides, so one workspace's success
+  // can never mask another's failure.
   try {
-    if (existsSync(pushStatusFile)) {
+    if (pushStatuses.length > 0) {
       const { PUSH_STALE_MS } = await import('./hook.ts'); // hook.ts owns the threshold (single source)
-      const s = JSON.parse(readFileSync(pushStatusFile, 'utf8')) as { ts?: string; ok?: boolean; reason?: string };
-      const t = s.ts ? Date.parse(s.ts) : NaN;
-      const stale = Number.isFinite(t) && Date.now() - t > PUSH_STALE_MS;
-      let dirty = false;
-      if (ws) {
-        try {
-          dirty = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
-            stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-          }).toString().trim() !== '';
-        } catch { dirty = false; }
-      }
-      if (s.ok === false) {
+      const failing = pushStatuses.filter((s) => s.ok === false);
+      if (failing.length > 0) {
+        const s = failing[0]!;
+        const target = s.repoRoot ?? ws ?? undefined;
+        const rest = failing.length > 1 ? ` [+${failing.length - 1} more workspace(s)]` : '';
         checks.push({
           name: 'bootstrap_push_health',
           status: 'warn',
-          message: `last workspace push FAILED (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'} — run \`gbrain sources push${ws ? ` --path ${ws}` : ''}\``,
+          message: `last workspace push FAILED${target ? ` for ${target}` : ''} (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'}${rest} — run \`gbrain sources push${target ? ` --path ${target}` : ''}\``,
         });
-      } else if (stale && dirty) {
-        checks.push({
-          name: 'bootstrap_push_health',
-          status: 'fail',
-          message: `last successful push ${s.ts} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
-        });
-      } else if (stale) {
-        checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${s.ts} (>48h ago); tree clean — likely just idle` });
       } else {
-        checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${s.ts ?? 'unknown'})` });
+        const stamps = pushStatuses.map((s) => Date.parse(s.ts ?? '')).filter((t) => Number.isFinite(t));
+        const stalest = stamps.length > 0 ? Math.min(...stamps) : NaN;
+        const staleIso = Number.isFinite(stalest) ? new Date(stalest).toISOString() : 'unknown';
+        const stale = Number.isFinite(stalest) && Date.now() - stalest > PUSH_STALE_MS;
+        let dirty = false;
+        if (ws) {
+          try {
+            dirty = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
+              stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+            }).toString().trim() !== '';
+          } catch { dirty = false; }
+        }
+        if (stale && dirty) {
+          checks.push({
+            name: 'bootstrap_push_health',
+            status: 'fail',
+            message: `last successful push ${staleIso} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
+          });
+        } else if (stale) {
+          checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); tree clean — likely just idle` });
+        } else {
+          checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
+        }
       }
+    } else if (statusFilesOnDisk) {
+      // Files exist but none parsed — the tolerant reader skips corrupt
+      // records; doctor must not let that read as "no news is good news".
+      checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });
     }
   } catch {
-    checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push-status.json unreadable' });
+    checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });
   }
+
+  // 2b. Durability job [B7/D7]: presence + LIVENESS. A presence-only check
+  // certifies dead jobs as healthy (the autopilot-status failure mode), so
+  // this warns on plist-present-but-unloaded and stale pull logs. Only warns
+  // when the user actually consented to the job; containers/cloud sandboxes
+  // are expected to have none.
+  try {
+    if (ws !== null && receipt !== null) {
+      const { detectExecutionEnvironment } = await import('../core/execution-env.ts');
+      const envKind = detectExecutionEnvironment();
+      if (envKind !== 'local') {
+        // Answered BEFORE the subprocess probes — cloud/container doctor
+        // runs must not pay launchctl/crontab spawns for an answer that is
+        // discarded (no scheduler exists there by design).
+        checks.push({
+          name: 'bootstrap_durability_job',
+          status: 'ok',
+          message: `no scheduler in this environment (${envKind}) — expected; per-turn and session-end pushes cover persistence`,
+        });
+      } else {
+      const { durabilityJobStatus } = await import('../core/brain-repo-durability.ts');
+      const { readInterviewState } = await import('../core/bootstrap/interview.ts');
+      const sourceId = receipt.source_id ?? 'workspace';
+      const js = durabilityJobStatus(sourceId);
+      let consented = false;
+      try {
+        const iv = readInterviewState(ws);
+        consented = iv.ok && (iv.state.answers['PERSIST_CRON']?.value ?? '').toLowerCase() === 'yes';
+      } catch { consented = false; }
+      if (!consented) {
+        if (js.kind !== 'none') {
+          checks.push({ name: 'bootstrap_durability_job', status: 'ok', message: `${js.kind} pull job present (not required by consent — fine)` });
+        }
+        // no consent + no job → nothing to check; stay silent
+      } else if (js.kind === 'none') {
+        checks.push({
+          name: 'bootstrap_durability_job',
+          status: 'warn',
+          message: `background persistence was consented (PERSIST_CRON=yes) but no scheduled job exists — run \`gbrain sources harden ${sourceId}\``,
+        });
+      } else if (js.live === false) {
+        checks.push({
+          name: 'bootstrap_durability_job',
+          status: 'warn',
+          message: `${js.kind} job is on disk but NOT loaded — a dead job looks healthy to presence checks. Re-run \`gbrain sources harden ${sourceId}\` to reload it.`,
+        });
+      } else if (!js.wrapperPresent) {
+        checks.push({
+          name: 'bootstrap_durability_job',
+          status: 'warn',
+          message: `${js.kind} job exists but its wrapper script is missing — re-run \`gbrain sources harden ${sourceId}\``,
+        });
+      } else if (js.logFresh === false) {
+        checks.push({
+          name: 'bootstrap_durability_job',
+          status: 'warn',
+          message: `${js.kind} job present but the pull log is stale (no run within 2× the interval) — the job may be dead; re-run \`gbrain sources harden ${sourceId}\``,
+        });
+      } else if (js.kind === 'crontab' && js.logFresh === undefined) {
+        // The crontab LINE existing proves installation, not that the cron
+        // daemon runs it — with no pull log yet we can't claim liveness.
+        checks.push({ name: 'bootstrap_durability_job', status: 'ok', message: 'crontab pull job installed (no run logged yet — liveness confirmed once it first fires)' });
+      } else {
+        checks.push({ name: 'bootstrap_durability_job', status: 'ok', message: `${js.kind} pull job present and live` });
+      }
+      }
+    }
+  } catch { /* best-effort — durability probing never fails doctor */ }
 
   // 3. One-live-serve / lock collision note. A live serve is the healthy
   // shape (it provides hook IPC); the note names the v1 contract.
@@ -8667,6 +8818,155 @@ export function skillsManifestIntegrityCheck(skillsDir: string): Check {
       `skills/ drifted from ${SKILLS_MANIFEST_FILENAME} (advisory — local edits are fine): ${parts.join('; ')}. ` +
       `If intentional, regenerate: bun run scripts/generate-skills-manifest.ts`,
     details: { modified: drift.modified, missing: drift.missing, extra: drift.extra },
+  };
+}
+
+/**
+ * Skill currency check — compares the built-in skills bundle against what
+ * the downstream workspace has scaffolded and surfaces NEW skills the user
+ * doesn't have yet. Advisory: `new` skills are a WARN (you're missing
+ * shipped capability); `drifted` skills are informational only (local edits
+ * are legitimate — the ownership model). No-ops when running inside the
+ * gbrain repo itself (bundle == install, always current) or when the bundle
+ * can't be located.
+ */
+export function skillCurrencyCheck(skillsDir: string): Check {
+  const name = 'skill_currency';
+  const targetWorkspace = resolvePath(skillsDir, '..');
+  const gbrainRoot = findGbrainRoot();
+  if (!gbrainRoot) {
+    return { name, status: 'ok', message: 'skill currency not applicable (no bundled skills pack found)' };
+  }
+  if (resolvePath(targetWorkspace) === resolvePath(gbrainRoot)) {
+    return { name, status: 'ok', message: 'skill currency not applicable (running inside the gbrain repo)' };
+  }
+  let report: ReturnType<typeof computeSkillCurrency>;
+  try {
+    report = computeSkillCurrency({ gbrainRoot, targetWorkspace });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { name, status: 'ok', message: `skill currency check skipped (${msg})` };
+  }
+  const { counts, skills } = report;
+  const sample = (status: 'new' | 'drifted'): string => {
+    const s = skills.filter(k => k.status === status).map(k => k.slug);
+    return s.slice(0, 8).join(', ') + (s.length > 8 ? `, … +${s.length - 8} more` : '');
+  };
+  if (counts.new === 0) {
+    const drift = counts.drifted > 0 ? ` (${counts.drifted} drifted — local edits are fine)` : '';
+    return { name, status: 'ok', message: `${counts.current}/${counts.total} built-in skills current${drift}` };
+  }
+  return {
+    name,
+    status: 'warn',
+    message:
+      `${counts.new} new built-in skill(s) available that this workspace hasn't installed: ${sample('new')}. ` +
+      `Add them with \`gbrain skillpack sync\`.` +
+      (counts.drifted > 0 ? ` (${counts.drifted} drifted from the bundle — local edits are fine.)` : ''),
+    details: {
+      new: skills.filter(k => k.status === 'new').map(k => k.slug),
+      drifted: skills.filter(k => k.status === 'drifted').map(k => k.slug),
+    },
+  };
+}
+
+/**
+ * Skill preconditions check — the LIVE half of the `requires:` frontmatter
+ * contract. For every skill INSTALLED in this workspace that declares
+ * preconditions, verify each against the connected brain and WARN on unmet
+ * ones with a paste-ready hint. Engine-dependent: skips cleanly when there
+ * is no brain to check against (the static list lives in
+ * `gbrain skillpack setup`).
+ */
+export async function skillPreconditionsCheck(
+  skillsDir: string,
+  engine: BrainEngine | null,
+): Promise<Check> {
+  const name = 'skill_preconditions';
+  if (!engine) {
+    return { name, status: 'ok', message: 'skill preconditions not checked (no connected brain)' };
+  }
+  // Collect installed skills declaring `requires:`.
+  let installed: { slug: string; requires: string[] }[];
+  try {
+    installed = readdirSync(skillsDir, { withFileTypes: true })
+      .filter(e => e.isDirectory())
+      .map(e => {
+        const md = join(skillsDir, e.name, 'SKILL.md');
+        if (!existsSync(md)) return null;
+        const fm = parseSkillFrontmatter(readFileSync(md, 'utf-8'));
+        const requires = fm?.requires ?? [];
+        return requires.length > 0 ? { slug: e.name, requires } : null;
+      })
+      .filter((x): x is { slug: string; requires: string[] } => x !== null);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { name, status: 'ok', message: `skill preconditions check skipped (${msg})` };
+  }
+  if (installed.length === 0) {
+    return { name, status: 'ok', message: 'no installed skills declare preconditions' };
+  }
+
+  // Engine-backed precondition context. Read-only COUNT/getConfig queries;
+  // no source scoping (doctor is a trusted local context). Every accessor
+  // fails soft to a conservative value so a query error never throws the check.
+  const ctx: PreconditionContext = {
+    async countPages() {
+      try {
+        const rows = await engine.executeRaw<{ n: number }>('SELECT COUNT(*)::int AS n FROM pages');
+        return rows[0]?.n ?? 0;
+      } catch { return 0; }
+    },
+    async countPagesInDir(dir: string) {
+      const prefix = dir.endsWith('/') ? dir : `${dir}/`;
+      try {
+        const rows = await engine.executeRaw<{ n: number }>(
+          `SELECT COUNT(*)::int AS n FROM pages WHERE slug LIKE $1 ESCAPE '\\'`,
+          [`${prefix.replace(/[%_\\]/g, m => `\\${m}`)}%`],
+        );
+        return rows[0]?.n ?? 0;
+      } catch { return 0; }
+    },
+    async listSourceIds() {
+      try {
+        const rows = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE id <> 'default'`);
+        return rows.map(r => r.id);
+      } catch { return []; }
+    },
+    async countPagesForSource(id: string) {
+      try {
+        const rows = await engine.executeRaw<{ n: number }>(
+          'SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1',
+          [id],
+        );
+        return rows[0]?.n ?? 0;
+      } catch { return 0; }
+    },
+    async getConfig(key: string) {
+      try {
+        return (await engine.getConfig(key)) ?? undefined;
+      } catch { return undefined; }
+    },
+  };
+
+  const unmet: string[] = [];
+  for (const skill of installed) {
+    const results = await checkPreconditions(skill.requires, ctx);
+    for (const r of results) {
+      if (!r.met) unmet.push(`${skill.slug}: ${r.req.raw} — ${r.hint}`);
+    }
+  }
+  if (unmet.length === 0) {
+    return { name, status: 'ok', message: `${installed.length} skill(s) with preconditions, all met` };
+  }
+  return {
+    name,
+    status: 'warn',
+    message:
+      `${unmet.length} unmet skill precondition(s):\n  ` +
+      unmet.slice(0, 8).join('\n  ') +
+      (unmet.length > 8 ? `\n  … +${unmet.length - 8} more` : ''),
+    details: { unmet },
   };
 }
 

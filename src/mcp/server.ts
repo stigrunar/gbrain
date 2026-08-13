@@ -17,7 +17,26 @@ import {
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 import { assembleTurnContext } from '../core/context/turn-context.ts';
+import { gcSessionContextState } from '../core/context/session-state.ts';
+import { makeContextPackIpcHandler } from './context-pack-handler.ts';
 import { logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
+
+export async function resolveMcpStdioSourceScope(
+  engine: BrainEngine,
+  cwd: string = process.cwd(),
+): Promise<{ sourceId: string; localFederatedSourceIds?: string[] }> {
+  try {
+    const { resolveSourceWithTier, localFederatedSourceIds } = await import('../core/source-resolver.ts');
+    const resolved = await resolveSourceWithTier(engine, null, cwd);
+    const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    return {
+      sourceId: resolved.source_id,
+      ...(federated ? { localFederatedSourceIds: federated } : {}),
+    };
+  } catch {
+    return { sourceId: process.env.GBRAIN_SOURCE || 'default' };
+  }
+}
 
 export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface } = {}) {
   const server = new Server(
@@ -46,20 +65,11 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
   server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
     const { name, arguments: params } = request.params;
-    // #3242: when the operator didn't pin a source via GBRAIN_SOURCE, stdio
-    // reads span every `config.federated = true` source (same visibility set
-    // as unqualified local CLI reads). GBRAIN_SOURCE set = explicit scope,
-    // no widening. Best-effort: a resolver failure keeps the scalar scope.
-    // ponytail: one tiny SELECT per tool call; cache it if it ever shows up.
-    let localFederated: string[] | undefined;
-    try {
-      const { localFederatedSourceIds } = await import('../core/source-resolver.ts');
-      localFederated = await localFederatedSourceIds(
-        engine,
-        process.env.GBRAIN_SOURCE || 'default',
-        process.env.GBRAIN_SOURCE ? 'env' : 'seed_default',
-      );
-    } catch { /* scalar scope stands */ }
+    // #3242 / #3906: stdio resolves its source through the same ambient chain
+    // as local CLI dispatch: GBRAIN_SOURCE, then .gbrain-source, then the
+    // non-explicit fallback tiers. Non-explicit tiers may widen to federated
+    // local reads; explicit/env/dotfile scopes stay scalar.
+    const sourceScope = await resolveMcpStdioSourceScope(engine);
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
     // takes-holder allow-list to ['world'] so agent-facing callers don't
     // see private hunches via takes_list / takes_search / query. Operators
@@ -81,11 +91,10 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       transport: 'stdio',
       takesHoldersAllowList: ['world'],
       ...(sessionId ? { sessionId } : {}),
-      // v0.31: source defaults to 'default' for stdio (no per-token scope).
-      // Operators who want a different source on stdio MCP should set
-      // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
-      ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
+      sourceId: sourceScope.sourceId,
+      ...(sourceScope.localFederatedSourceIds
+        ? { localFederatedSourceIds: sourceScope.localFederatedSourceIds }
+        : {}),
       // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
       // Code see the brain's relevant hot memory automatically alongside
       // every tool-call response. Best-effort; absorbs errors.
@@ -110,7 +119,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     const cfg = loadConfig();
     if (cfg?.engine === 'pglite' && cfg.database_path) {
       resolveSocket = resolveSocketPath(cfg.database_path);
-      const defaultSource = process.env.GBRAIN_SOURCE || 'default';
+      const { sourceId: defaultSource } = await resolveMcpStdioSourceScope(engine);
       // [S3#6] turn_context requires the shared secret from the data dir
       // (created 0600 here if absent). If the secret can't be provisioned,
       // turn_context stays fail-closed ('unauthorized') while the secret-free
@@ -150,6 +159,11 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
               sessionId: req.sessionId,
               maxBytes: req.maxBytes,
             }),
+          // v0.45.7 ambient recall: boundary context pack. Extracted to
+          // context-pack-handler.ts (directly testable against a real engine);
+          // the runtime owns entity merge, banking, the since-cursor, and the
+          // complete-pack-only monotonic cursor advance.
+          context_pack: makeContextPackIpcHandler(engine, defaultSource),
         },
         {
           // The IPC resolve path IS the ambient reflex channel. Logging happens
@@ -173,6 +187,10 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     /* resolve IPC is best-effort; never block serve */
   }
 
+  // v0.45.7 ambient recall: age out stale session cursors once per serve boot
+  // (7-day TTL, indexed DELETE). Best-effort — GC failure never blocks serve.
+  gcSessionContextState(engine).catch(() => {});
+
   // Startup maintenance sweep [ENG-5][CX-P0.1+P0.3]: the serve process is
   // the lock owner, so it runs the bounded sweep that ingests the corpus +
   // reconciles fences/links/timeline for recent workspace writes. Same
@@ -183,8 +201,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   let startupSweep: { cancel: () => void } | null = null;
   try {
     const { armStartupSweep } = await import('../core/sweep.ts');
+    const { sourceId } = await resolveMcpStdioSourceScope(engine);
     startupSweep = armStartupSweep(engine, {
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
+      sourceId,
     });
   } catch {
     /* startup sweep is best-effort; never block serve */
