@@ -10,7 +10,7 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
-import { writePageThrough } from './write-through.ts';
+import { writePageThrough, type WriteThroughResult } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags, stampUnverifiedExtractions } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
@@ -1323,7 +1323,10 @@ const put_page: Operation = {
     // Trust gating:
     //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
     //   - All other writes → write-through.
-    let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
+    // put_page's own trust-gating produces two skip reasons ('subagent_sandbox',
+    // 'dry_run') that never come out of writePageThrough itself — widen the
+    // field rather than losing the commit/pushed/lastPushStatus typing.
+    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
@@ -2773,10 +2776,12 @@ const get_brain_identity: Operation = {
     let latest_version: string | null = null;
     try {
       const su = await import('./self-upgrade.ts');
-      const entry = su.readUpdateCache();
-      if (entry && su.isCacheFresh(entry, Date.now()) && entry.marker.kind === 'upgrade_available') {
+      // Shared stale/foreign-cache guard (pendingUpgradeVersion): only an
+      // upgrade strictly newer than the RUNNING version counts.
+      const latest = su.pendingUpgradeVersion(VERSION, Date.now());
+      if (latest) {
         update_available = true;
-        latest_version = entry.marker.latest ?? null;
+        latest_version = latest;
       }
     } catch {
       /* never let the banner break the op */
