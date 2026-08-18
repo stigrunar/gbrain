@@ -24,8 +24,10 @@ import {
   ABORT_REASON_LOCK_LOST,
 } from './types.ts';
 import { MinionQueue } from './queue.ts';
+import { runWaitingTtlTick, ttlNoticeGraceMs } from './admission.ts';
 import { calculateBackoff } from './backoff.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
+import { leaseFullBackoffMs } from './rate-leases.ts';
 import { logLeasePressure } from './lease-pressure-audit.ts';
 import {
   runLockRenewalTick,
@@ -437,6 +439,33 @@ export class MinionWorker extends EventEmitter {
       } catch (e) {
         console.error('Wall-clock timeout detection error:', e instanceof Error ? e.message : String(e));
         await recoverConnection('handleWallClockTimeouts', e);
+      }
+      // 4th sweep: waiting-TTL (admission control). Warn-before-act (user
+      // requirement D1A) lives in runWaitingTtlTick (admission.ts): the first
+      // tick counts + stamps the notice timestamp, sweeping starts only after
+      // the grace window elapses. The gate is engine-state (not process
+      // state) because the worker restarts via self-upgrade/systemd without
+      // ever running the CLI's runPostUpgrade banner; the notice must precede
+      // the cancellation on EVERY channel, and the worker log is the daemon
+      // channel.
+      try {
+        const tick = await runWaitingTtlTick(this.engine, this.queue);
+        if (tick.phase === 'notice') {
+          console.log(
+            `⚠ Waiting-TTL is now active: ${tick.affected ?? 0} queued job(s) currently exceed their TTL and ` +
+            `will be cancelled after a ${Math.round(ttlNoticeGraceMs() / 60_000)}min grace window. ` +
+            `Tune: gbrain config set minions.ttl_waiting_hours.<name> <hours|0>.`,
+          );
+        } else if (tick.phase === 'swept' && tick.cancelled > 0) {
+          const breakdown = Object.entries(tick.by_name).map(([n, c]) => `${n}: ${c}`).join(', ');
+          console.log(
+            `Waiting-TTL: cancelled ${tick.cancelled} job(s) that waited past their TTL (${breakdown}). ` +
+            `Tune: gbrain config set minions.ttl_waiting_hours.<name> <hours|0>. See 'gbrain jobs stats'.`,
+          );
+        }
+      } catch (e) {
+        console.error('Waiting-TTL sweep error:', e instanceof Error ? e.message : String(e));
+        await recoverConnection('handleWaitingTTL', e);
       }
     }, this.opts.stalledInterval);
 
@@ -1410,9 +1439,10 @@ export class MinionWorker extends EventEmitter {
       const isLeaseFull = err instanceof RateLeaseUnavailableError;
       if (isLeaseFull) {
         const leaseErr = err as RateLeaseUnavailableError;
-        // 1-3s jittered backoff. Not the exponential curve — this is "yield
-        // the slot, try again soon", not "give up after a few tries."
-        const leaseBackoffMs = 1000 + Math.floor(Math.random() * 2000);
+        // 1-3s jittered backoff (shared with the inline drain — one curve,
+        // no silent desync). Not the exponential curve — this is "yield the
+        // slot, try again soon", not "give up after a few tries."
+        const leaseBackoffMs = leaseFullBackoffMs();
         const released = await this.queue.releaseLeaseFullJob(
           job.id, lockToken, errorText, leaseBackoffMs,
         );

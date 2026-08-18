@@ -393,6 +393,10 @@ Options:
                       completion. When omitted, gbrain derives the
                       source from --dir / the configured checkout
                       when it matches a source's local_path (#1869).
+                      A named non-default source runs the deterministic
+                      freshness phases unless --phase is given
+                      (explicit phases are honored verbatim);
+                      --source default still runs the full cycle.
   --source-id <id>    Alias for --source. Matches the v0.37.7.0+
                       naming used by import/extract/graph-query.
 
@@ -454,9 +458,29 @@ function printHuman(report: CycleReport) {
   }
 
   if (report.status === 'clean') {
+    // A 'clean' cycle can still carry a skip reason worth surfacing — e.g.
+    // synthesize's D8 legacy-key / D5 oversize-chunk skips leave
+    // transcripts_processed/synth_pages_written at 0 (so deriveStatus sees
+    // no activity) while `details.skips` names exactly why each transcript
+    // was passed over. Without this, `--input <already-handled-file>`
+    // prints only "Brain is healthy" with no indication anything was
+    // examined and skipped.
+    const skipLines: string[] = [];
+    for (const p of report.phases) {
+      const skips = (p.details as { skips?: Array<{ filePath: string; reason: string }> } | undefined)?.skips;
+      if (Array.isArray(skips)) {
+        for (const s of skips) {
+          skipLines.push(`  - ${p.phase}: ${s.filePath} (${s.reason})`);
+        }
+      }
+    }
     console.log(
       `Brain is healthy. ${report.phases.length} phase(s) checked in ${(report.duration_ms / 1000).toFixed(1)}s.`,
     );
+    if (skipLines.length > 0) {
+      console.log('Skipped:');
+      for (const line of skipLines) console.log(line);
+    }
     return;
   }
 
@@ -488,6 +512,14 @@ function printHuman(report: CycleReport) {
     );
   }
 }
+
+// ── Test-only export ───────────────────────────────────────
+// `__testing` re-exports otherwise-private helpers so unit tests can pin
+// CLI output behavior without spawning a subprocess. Not part of the
+// runtime contract.
+export const __testing = {
+  printHuman,
+};
 
 // ─── CLI entry ─────────────────────────────────────────────────────
 

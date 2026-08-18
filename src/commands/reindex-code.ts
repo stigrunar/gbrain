@@ -134,6 +134,11 @@ async function fetchCodePages(
   // Direct SQL: listPages doesn't expose source_id filtering, and we need
   // compiled_truth + frontmatter anyway (not just the Page shape).
   const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
+  // source_id is SELECTed so the per-page re-import below targets each row's
+  // OWN source. Pre-fix this iterated all sources' code pages but imported
+  // with the CLI-level sourceId (undefined without --source), which — now
+  // that import reads/writes are default-scoped — would duplicate every
+  // non-default-source code page into 'default' and re-embed it.
   const rows = await engine.executeRaw<CodePageRow>(
     `SELECT p.slug, p.source_id, p.compiled_truth, p.frontmatter
      FROM pages p
@@ -302,6 +307,9 @@ export async function runReindexCode(
               const result = await importCodeFile(engine, relPath, row.compiled_truth, {
                 noEmbed: opts.noEmbed,
                 force: opts.force,
+                // Each page re-imports into its OWN source (row-level), not
+                // the CLI-level default — reindex must be an in-place
+                // rebuild, never a cross-source copy.
                 sourceId: row.source_id,
               });
               if (result.status === 'imported') reindexed++;
