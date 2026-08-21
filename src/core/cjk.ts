@@ -137,3 +137,18 @@ export function estimateEmbeddingTokens(s: string): number {
   }
   return Math.ceil(est);
 }
+
+/**
+ * Splits a CJK query into distinct, non-empty whitespace-delimited terms.
+ *
+ * In Korean and Japanese, word order is flexible and particles attach to nouns,
+ * so the same fact or search intent frequently appears in varying token sequences
+ * (e.g. "김대리 미팅" vs "미팅 김대리"). Splitting into individual terms allows
+ * multi-term conjunction (AND matching) across chunk text regardless of word order.
+ *
+ * Returns deduplicated terms preserving the original order of appearance.
+ */
+export function splitCJKQueryTerms(query: string): string[] {
+  const terms = query.split(/\s+/).filter(t => t.length > 0);
+  return Array.from(new Set(terms));
+}
