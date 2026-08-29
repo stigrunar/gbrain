@@ -18,10 +18,17 @@ export const ollama: Recipe = {
         'nomic-embed-text',
         'mxbai-embed-large',
         'all-minilm',
-        'qwen3-embed-8b',
+        // Real Ollama library tags (verified 2026-08-08): the family is
+        // published as `qwen3-embedding` with size tags, and Arctic Embed
+        // 2.0 as `snowflake-arctic-embed2`. The earlier `qwen3-embed-8b` /
+        // HF-style `snowflake-arctic-embed-l-v2` spellings stay listed so
+        // brains initialized with them keep validating, but they never
+        // matched a pullable Ollama tag.
         'qwen3-embedding:8b',
         'qwen3-embedding:4b',
         'qwen3-embedding:0.6b',
+        'qwen3-embed-8b',
+        'snowflake-arctic-embed2',
         'snowflake-arctic-embed-l-v2',
         'bge-m3',
       ],
@@ -36,7 +43,11 @@ export const ollama: Recipe = {
         'nomic-embed-text': 768,
         'mxbai-embed-large': 1024,
         'all-minilm': 384,
+        'qwen3-embedding:8b': 4096,
+        'qwen3-embedding:4b': 2560,
+        'qwen3-embedding:0.6b': 1024,
         'qwen3-embed-8b': 4096,
+        'snowflake-arctic-embed2': 1024,
         'snowflake-arctic-embed-l-v2': 1024,
         'bge-m3': 1024,
       },

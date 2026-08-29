@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 import { loadConfigSnapshot } from './config-snapshot.ts';
+import { loadGbrainEnvFile } from './gbrain-env-file.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -79,6 +80,21 @@ export interface GBrainConfig {
    * voyage_api_key above.
    */
   dashscope_api_key?: string;
+  /**
+   * LiteLLM proxy API key. File-plane slot folded into the gateway env as
+   * LITELLM_API_KEY (optional in the litellm recipe — proxies may run
+   * unauthenticated locally). Closed alongside litellm's chat touchpoint
+   * (v0.42.61.0): once litellm became a full chat provider, daemon/launchd/
+   * MCP contexts hit the same config-plane gap voyage did (#2662). Same
+   * fold pattern (and same DB-plane caveat) as voyage_api_key above.
+   */
+  litellm_api_key?: string;
+  /**
+   * Together AI API key. File-plane slot folded into the gateway env as
+   * TOGETHER_API_KEY (required by the together recipe). Same fold pattern
+   * (and same DB-plane caveat) as voyage_api_key above.
+   */
+  together_api_key?: string;
   /**
    * Google Gemini API key (#3500). File-plane slot folded into the gateway
    * env as GOOGLE_GENERATIVE_AI_API_KEY (the name the google recipe reads).
@@ -654,6 +670,13 @@ export function envShadowDetected(dir: string = process.cwd()): boolean {
 }
 
 export function loadConfig(): GBrainConfig | null {
+  // #3893 (reimplemented from @y2688): fill process.env from the
+  // operator-owned ~/.gbrain/.env BEFORE the env-over-file merge below, so
+  // secrets can live outside config.json. Shell-exported env always wins
+  // (the loader never overrides an existing var), and cwd .env files stay
+  // untrusted (#427 guard above).
+  loadGbrainEnvFile(getConfigDir);
+
   let fileConfig: GBrainConfig | null = null;
   try {
     const raw = readFileSync(getConfigPath(), 'utf-8');
@@ -1127,6 +1150,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',
+  'litellm_api_key',
+  'together_api_key',
   'google_api_key',
   'azure_openai_api_key',
   'azure_openai_endpoint',
@@ -1237,6 +1262,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `gbrain config set facts.extraction_enabled false` — which was rejected
   // as an unknown key until this registration.
   'facts.extraction_enabled',
+  // Open-loop engine kill switch: LLM commitment/decision extraction over
+  // google-source email pages (default ON for google sources; deterministic
+  // thread detection is unaffected). `gbrain config set loops.extraction_enabled false`.
+  'loops.extraction_enabled',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
@@ -1329,13 +1358,15 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Misc
   'artifacts_sync_mode',
   'cross_project_learnings',
-  // Link resolution (issue #972)
+  // Link resolution (issue #972; cross_source is issue #2589)
   'link_resolution',
   'link_resolution.global_basename',
+  'link_resolution.cross_source',
   // Spend controls (v0.42.42.0, issue #2139). Previously `--force`-only — the
   // operator had to discover these by reading source. Registered so `config
   // set` accepts them directly. See docs/operations/spend-controls.md.
   'spend.posture',
+  'pricing.overrides',
   // Life Chronicle (v0.42.56.0, #2390). The release notes' enable command is
   // `gbrain config set auto_chronicle true`, but the key was never registered
   // — so the documented command failed with "Unknown config key" and the
@@ -1368,6 +1399,13 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
   'sync.include_working_tree',
+  // Persisted indexing scope (comma/newline-separated glob list; trailing '/'
+  // normalizes to a '/**' subtree glob). Read best-effort at the top of
+  // performSyncInner and UNIONED with any per-call --exclude so internal
+  // callers (autopilot, minion sync jobs, dream cycle) honor the same scope.
+  // Registering it here is what makes `gbrain config set sync.exclude ...`
+  // work — the operator path to the feature (unregistered-key class).
+  'sync.exclude',
   // #2179: clamp window for DCR-requested per-client token TTLs. Read by
   // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
   // defaults fail-closed to max(--token-ttl, min).
