@@ -121,7 +121,7 @@ function printCodeModelNudge(decision: Extract<NudgeDecision, { shouldNudge: tru
 interface CodePageRow {
   slug: string;
   source_id: string;
-  compiled_truth: string;
+  compiled_truth: string | null;
   frontmatter: Record<string, unknown> | null;
 }
 
@@ -280,6 +280,15 @@ export async function runReindexCode(
             if (!relPath) {
               failed++;
               failures.push({ slug: row.slug, error: 'missing frontmatter.file' });
+              reporter.tick();
+              return;
+            }
+            // `compiled_truth` is NOT NULL DEFAULT '': an empty file is legitimately '' (every
+            // `__init__.py`). Only a null row is missing; the falsy check counted every empty
+            // file as a failure (#4902).
+            if (row.compiled_truth == null) {
+              failed++;
+              failures.push({ slug: row.slug, error: 'missing compiled_truth' });
               reporter.tick();
               return;
             }
