@@ -277,8 +277,11 @@ Active items, pending decisions, things to track.
 **Note (v0.10.1):** Links between brain pages are auto-created on every
 `put_page` call (auto-link post-hook). Step 7 focuses on content
 cross-references (updating related pages' compiled truth with new signal
-from this enrichment), not on creating links. Verify via the `auto_links`
-field in the put_page response (`{ created, removed, errors }`).
+from this enrichment), not on creating links. On a trusted local write the
+put_page response carries `auto_links: { created, removed, errors }`; MCP
+writes (stdio and HTTP) return `auto_links: { skipped: "remote", hint }`
+instead — edges are reconciled by the serve maintenance sweep or
+`gbrain sweep --once`, and `add_link` covers an edge you need immediately.
 Timeline entries still need explicit `gbrain timeline-add` calls.
 
 ## Bulk Enrichment Rules
@@ -308,6 +311,14 @@ After enrichment sweeps, save a report:
 - Validation flags or API failures
 
 This creates an audit trail for brain enrichment over time.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- External enrichment APIs return `rate_limited` or an auth failure: back off for the stated delay; on auth failure stop and tell the user which key is missing. Never fill the gap with guessed facts.
+- `put_page` returns `revision_conflict`: re-read the entity page, merge, and save with the new revision.
+- `auto_links.errors` is non-empty on a write: the page saved but some links did not; list them in the report and add them with `add_link` after fixing the slugs.
 
 ## Anti-Patterns
 
@@ -347,3 +358,12 @@ Both page types have bidirectional back-links to every entity they mention.
 - Retrieve raw data from gbrain (get_raw_data)
 - Link entities in gbrain (add_link)
 - Check backlinks in gbrain (get_backlinks)
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `add_link` → `gbrain link`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

@@ -7,13 +7,14 @@
  * hook child.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type net from 'node:net';
 
 import { runHook } from '../src/commands/hook.ts';
 import { readHeartbeatTail } from '../src/core/context/hook-heartbeat.ts';
+import { CLAUDE_CLI_CWD_PREFIX } from '../src/core/ai/providers/claude-cli-scratch.ts';
 import { startResolveIpcServer, ensureIpcSecret, resolveSocketPath, type ContextPackRequest, } from '../src/core/context/resolve-ipc.ts';
 import type { TurnContextResult } from '../src/core/context/turn-context.ts';
 
@@ -81,6 +82,56 @@ function writeTranscript(userText: string, opts: { assistantOnly?: boolean; assi
   return { path: p, root };
 }
 
+function writeTranscriptWithToolResult(userText: string, resultChars: number): { path: string; root: string } {
+  const root = join(tmp, 'projects-root');
+  mkdirSync(root, { recursive: true });
+  const p = join(root, 'session.jsonl');
+  const lines = [
+    JSON.stringify({
+      parentUuid: null, isSidechain: false, type: 'user',
+      message: { role: 'user', content: userText },
+      uuid: 'u-1', sessionId: 's-wb', timestamp: '2026-09-01T10:00:00.000Z',
+    }),
+    JSON.stringify({
+      parentUuid: 'u-1', isSidechain: false, type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: '/tmp/a' } }] },
+      uuid: 'a-1', sessionId: 's-wb', timestamp: '2026-09-01T10:00:01.000Z',
+    }),
+    JSON.stringify({
+      parentUuid: 'a-1', isSidechain: false, type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'x'.repeat(resultChars) }] },
+      uuid: 'u-tool-1', sessionId: 's-wb', timestamp: '2026-09-01T10:00:02.000Z',
+    }),
+    JSON.stringify({
+      parentUuid: 'u-tool-1', isSidechain: false, type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Done — noted.' }] },
+      uuid: 'a-2', sessionId: 's-wb', timestamp: '2026-09-01T10:00:03.000Z',
+    }),
+  ];
+  writeFileSync(p, lines.join('\n') + '\n');
+  return { path: p, root };
+}
+
+/** A claude-code JSONL transcript of alternating turns under `<root>/<project>/session.jsonl`. */
+function writeTurns(turns: Array<{ role: 'user' | 'assistant'; text: string }>, project = 'app'): { path: string; root: string } {
+  const root = join(tmp, 'projects-root');
+  mkdirSync(join(root, project), { recursive: true });
+  const p = join(root, project, 'session.jsonl');
+  writeFileSync(p, turns.map((t, i) => JSON.stringify({
+    parentUuid: i === 0 ? null : `t-${i - 1}`, isSidechain: false, type: t.role,
+    message: { role: t.role, content: t.role === 'user' ? t.text : [{ type: 'text', text: t.text }] },
+    uuid: `t-${i}`, sessionId: 's-wb', timestamp: `2026-09-01T10:00:0${i}.000Z`,
+  })).join('\n') + '\n');
+  return { path: p, root };
+}
+
+const PASTE = '<pasted_content id="2830">\nForwarded: the offsite moves to March and the budget is final.\n</pasted_content id="2830">';
+
+function bankedTexts(): string[] {
+  if (!existsSync(corpus())) return [];
+  return readdirSync(corpus()).filter((f) => f.includes('.wb-')).map((f) => readFileSync(join(corpus(), f), 'utf8'));
+}
+
 const io = { write: () => {} };
 
 async function wbHeartbeats() {
@@ -127,6 +178,32 @@ describe('hook stop — ambient writeback banking', () => {
       stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path }),
     })).toBe(0);
     expect((await wbHeartbeats())[0]?.reason).toBe('no_user_turn');
+  });
+
+  test('tool_result user entries do not shadow the genuine user prompt', async () => {
+    writeConfig({ writeback: 'salient' });
+    const prompt = 'I prefer dark mode in every editor, and I want weekly summaries.';
+    const t = writeTranscriptWithToolResult(prompt, 20);
+    expect(await runHook(['stop'], {
+      ...io, transcriptRoot: t.root,
+      stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path }),
+    })).toBe(0);
+    const file = readdirSync(corpus()).find((f) => /^s-wb\.wb-[0-9a-f]{24}\.txt$/.test(f));
+    expect(file).toBeDefined();
+    expect(await Bun.file(join(corpus(), file!)).text()).toBe(prompt + '\n');
+  });
+
+  test('tool_result beyond the cheap tail triggers the wide retry for the genuine prompt', async () => {
+    writeConfig({ writeback: 'salient' });
+    const prompt = 'I prefer dark mode in every editor, and I want weekly summaries.';
+    const t = writeTranscriptWithToolResult(prompt, 140_000);
+    expect(await runHook(['stop'], {
+      ...io, transcriptRoot: t.root,
+      stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path }),
+    })).toBe(0);
+    const file = readdirSync(corpus()).find((f) => /^s-wb\.wb-[0-9a-f]{24}\.txt$/.test(f));
+    expect(file).toBeDefined();
+    expect(await Bun.file(join(corpus(), file!)).text()).toBe(prompt + '\n');
   });
 
   test('user turn pushed past the 128KB tail by ONE huge assistant payload: wide retry finds it — banked, NOT no_user_turn', async () => {
@@ -226,5 +303,58 @@ describe('hook stop — ambient writeback banking', () => {
     expect(seen[0].flushCorpusFile).toMatch(/^s-wb\.wb-[0-9a-f]{24}\.src-wiki\.txt$/);
     const hb = await wbHeartbeats();
     expect(hb.some((e) => e.reason === 'wb_scheduled' && e.outcome === 'ok')).toBe(true);
+  });
+});
+
+describe('hook stop — pasted content (#5812)', () => {
+  const OWN = 'I prefer dark roast coffee and I want it on every order.';
+
+  test('a mixed last turn banks only the user\'s own words', async () => {
+    writeConfig({ writeback: 'salient' });
+    const t = writeTurns([{ role: 'user', text: `Please remember this note I got: \n\n${PASTE}\n\n ${OWN}` }, { role: 'assistant', text: 'Saved.' }]);
+    expect(await runHook(['stop'], { ...io, transcriptRoot: t.root, stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path }) })).toBe(0);
+    expect(bankedTexts()).toEqual([`Please remember this note I got: ${OWN}\n`]);
+  });
+
+  test('a paste-only last turn banks nothing new: the previous genuine turn is the candidate (wb_dup)', async () => {
+    writeConfig({ writeback: 'salient' });
+    const first = [{ role: 'user' as const, text: OWN }, { role: 'assistant' as const, text: 'Saved.' }];
+    let t = writeTurns(first);
+    const payload = () => JSON.stringify({ session_id: 's-wb', transcript_path: t.path });
+    expect(await runHook(['stop'], { ...io, transcriptRoot: t.root, stdin: payload() })).toBe(0);
+    t = writeTurns([...first, { role: 'user', text: `\n\n${PASTE}\n` }, { role: 'assistant', text: 'Is this the same email?' }]);
+    expect(await runHook(['stop'], { ...io, transcriptRoot: t.root, stdin: payload() })).toBe(0);
+    expect(bankedTexts()).toEqual([`${OWN}\n`]);
+    expect((await wbHeartbeats()).map((e) => e.reason)).toEqual(['no_serve', 'wb_dup']);
+  });
+
+  test('a session whose only user turn is a paste → no_user_turn, no file', async () => {
+    writeConfig({ writeback: 'salient' });
+    const t = writeTurns([{ role: 'user', text: PASTE }, { role: 'assistant', text: 'Got it.' }]);
+    expect(await runHook(['stop'], { ...io, transcriptRoot: t.root, stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path }) })).toBe(0);
+    expect(bankedTexts()).toEqual([]);
+    expect((await wbHeartbeats())[0]?.reason).toBe('no_user_turn');
+  });
+});
+
+describe('hook stop — gbrain claude-cli self-capture (#5820)', () => {
+  const PROMPT = 'Extract the facts from the following page and return them as JSON objects.';
+
+  test('a Stop payload from a claude-cli scratch session banks nothing: by-design self_capture', async () => {
+    writeConfig({ writeback: 'salient' });
+    const t = writeTurns([{ role: 'user', text: PROMPT }, { role: 'assistant', text: '{"facts":[]}' }], `-tmp-${CLAUDE_CLI_CWD_PREFIX}4242`);
+    expect(await runHook(['stop'], { ...io, transcriptRoot: t.root, stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path }) })).toBe(0);
+    expect(bankedTexts()).toEqual([]);
+    const hb = await wbHeartbeats();
+    expect(hb.map((e) => [e.reason, e.outcome])).toEqual([['self_capture', 'ok']]);
+  });
+
+  test('the payload cwd fingerprint alone is enough', async () => {
+    writeConfig({ writeback: 'salient' });
+    const t = writeTurns([{ role: 'user', text: PROMPT }, { role: 'assistant', text: '{"facts":[]}' }]);
+    const cwd = join(tmpdir(), `${CLAUDE_CLI_CWD_PREFIX}4242`);
+    expect(await runHook(['stop'], { ...io, transcriptRoot: t.root, stdin: JSON.stringify({ session_id: 's-wb', transcript_path: t.path, cwd }) })).toBe(0);
+    expect(bankedTexts()).toEqual([]);
+    expect((await wbHeartbeats())[0]?.reason).toBe('self_capture');
   });
 });

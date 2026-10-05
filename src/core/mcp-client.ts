@@ -17,11 +17,19 @@
  * attempt is also rejected with HTTP 401, surface auth_after_refresh.
  */
 
+import { randomUUID } from 'node:crypto';
+import { isPersistenceIpcMutation } from './persistence/ipc.ts';
+import { replayWhilePending } from './persistence/write-wait.ts';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { anySignal } from './abort-check.ts';
+import { canonicalCodeFor } from './error-catalogue.ts';
 import type { GBrainConfig } from './config.ts';
 import { discoverOAuth, mintClientCredentialsToken } from './remote-mcp-probe.ts';
+import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt, type WriteErrorCode, type WriteReceipt } from './persistence/types.ts';
+import { GBRAIN_CLIENT_HEADER, GBRAIN_THIN_CLIENT_NAME } from '../mcp/result-rows.ts';
+import { VERSION } from '../version.ts';
 
 interface CachedToken {
   access_token: string;
@@ -58,6 +66,10 @@ export type RemoteMcpErrorReason =
   | 'discovery'
   | 'auth'
   | 'auth_after_refresh'
+  /** OAuth /token answered 429; `detail.retry_after_s` carries its Retry-After. */
+  | 'rate_limited'
+  /** OAuth /token failed after discovery succeeded (non-auth HTTP status or bad body). */
+  | 'token'
   | 'network'
   | 'tool_error'
   | 'parse';
@@ -69,6 +81,28 @@ export interface RemoteMcpErrorDetail {
   kind?: 'timeout' | 'aborted' | 'unreachable';
   /** v0.31.1: server-supplied error code on tool_error (e.g. 'missing_scope'). */
   code?: string;
+  /** Seconds the server asked us to wait before minting again (rate_limited). */
+  retry_after_s?: number;
+  /** An accepted mutation's receipt survives the transport's tool-error wrapper. */
+  write_request?: WriteReceipt;
+  write_error?: WriteErrorCode;
+  /** Retained even when no acknowledgment proves whether the write was accepted. */
+  request_id?: string;
+  submission_status?: 'unknown' | 'not_sent';
+  message?: string;
+  suggestion?: string;
+  protocol_version?: 1;
+  server_detail?: string;
+  docs?: string;
+  /** Agent contract v1: canonical registry code (`code`) when it differs from or adds to the wire `error` (kept in `code` above). */
+  canonical_code?: string;
+  reason?: string;
+  why?: string;
+  /** Rendered fix as the server sent it (`next` included). */
+  fix?: Record<string, unknown>;
+  /** Notices from the envelope's `notices` key (error results carry exactly one block). */
+  notices?: Array<Record<string, unknown>>;
+  contract_version?: 1;
 }
 
 export class RemoteMcpError extends Error {
@@ -80,6 +114,51 @@ export class RemoteMcpError extends Error {
     super(message);
     this.name = 'RemoteMcpError';
   }
+
+  /** Mutation error output shares the CLI/IPC envelope without inventing a receipt. */
+  toJSON() {
+    const detail = this.detail;
+    const unknown = detail?.submission_status === 'unknown';
+    const wire = detail?.code ?? 'unavailable';
+    return {
+      error: wire,
+      code: detail?.canonical_code ?? canonicalCodeFor(wire),
+      message: detail?.message ?? this.message,
+      ...(detail?.request_id ? { request_id: detail.request_id } : {}),
+      ...(detail?.submission_status ? { submission_status: detail.submission_status } : {}),
+      ...(unknown ? { detail: 'delivery_unknown' } : detail?.server_detail ? { detail: detail.server_detail } : {}),
+      suggestion: detail?.suggestion ?? (detail?.request_id
+        ? `${unknown ? 'Submission state is unknown. ' : ''}Retry the same operation and arguments with request_id ${detail.request_id}; do not generate a replacement ID.`
+        : 'Inspect the remote connection before retrying.'),
+      ...(detail?.protocol_version === 1 ? { protocol_version: 1 } : {}),
+      ...(detail?.docs ? { docs: detail.docs } : {}),
+      ...(detail?.write_request ? { write_request: publicWriteReceipt(detail.write_request) } : {}),
+      ...(detail?.write_error ? { write_error: detail.write_error } : {}),
+      ...(detail?.reason ? { reason: detail.reason } : {}),
+      ...(detail?.why ? { why: detail.why } : {}),
+      ...(detail?.fix ? { fix: detail.fix } : {}),
+      ...(detail?.notices?.length ? { notices: detail.notices } : {}),
+      ...(detail?.contract_version === 1 ? { contract_version: 1 } : {}),
+    };
+  }
+}
+
+/**
+ * B5 (#5949): a 429 on the /token mint is the host's mint budget, not a
+ * connectivity fault: code `rate_limited`, a provider-side wait, and the
+ * read-only check to run once the wait is over.
+ */
+function rateLimitedMintDetail(retryAfterS: number | undefined): RemoteMcpErrorDetail {
+  const wait = retryAfterS !== undefined ? `${retryAfterS}s` : 'a few minutes';
+  return {
+    code: 'rate_limited',
+    why: `The brain host's OAuth /token mint budget is spent (HTTP 429); it clears by itself in ${wait}.`,
+    suggestion: `Wait ${wait}, then re-run the same command. If this repeats, the host operator can raise GBRAIN_OAUTH_TOKEN_RATE_LIMIT_MAX.`,
+    fix: {
+      argv: ['gbrain', 'remote', 'doctor', '--json'], consent: [], actor: 'provider',
+      why: `Retry after ${wait}; remote doctor confirms the token mint works again.`, requires_exclusive: false,
+    },
+  };
 }
 
 /**
@@ -92,6 +171,9 @@ export class RemoteMcpError extends Error {
  * the callRemoteTool funnel.
  */
 export function toRemoteMcpError(e: unknown, mcpUrl: string, signal?: AbortSignal): RemoteMcpError {
+  // A received receipt is stronger evidence than a deadline that fired while
+  // unwinding the call. Losing it invites a second mutation after acceptance.
+  if (e instanceof RemoteMcpError && e.detail?.write_request) return e;
   if (signal?.aborted) {
     const kind = signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
       ? 'timeout' : 'aborted';
@@ -102,6 +184,11 @@ export function toRemoteMcpError(e: unknown, mcpUrl: string, signal?: AbortSigna
     );
   }
   if (e instanceof RemoteMcpError) return e;
+  // The SDK's own request timer can fire while our composed signal is still
+  // live. A slow operation on a reachable server is a timeout, not unreachable.
+  if (e instanceof McpError && e.code === ErrorCode.RequestTimeout) {
+    return new RemoteMcpError('network', `Request to ${mcpUrl} timed out`, { mcp_url: mcpUrl, kind: 'timeout' });
+  }
   if (e instanceof Error) {
     if (e.name === 'AbortError' || e.name === 'TimeoutError') {
       return new RemoteMcpError(
@@ -153,6 +240,31 @@ export function extractToolErrorCode(message: string): string | undefined {
   return undefined;
 }
 
+/** Keep only validated public receipt fields from a tool's JSON error body. */
+export function extractToolErrorDetail(message: string): RemoteMcpErrorDetail {
+  const code = extractToolErrorCode(message);
+  const detail: RemoteMcpErrorDetail = code ? { code } : {};
+  try {
+    const body: unknown = JSON.parse(message);
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) return detail;
+    const envelope = body as Record<string, unknown>;
+    if (typeof envelope.message === 'string') detail.message = envelope.message;
+    if (typeof envelope.suggestion === 'string') detail.suggestion = envelope.suggestion;
+    if (envelope.protocol_version === 1) detail.protocol_version = 1;
+    if (typeof envelope.detail === 'string') detail.server_detail = envelope.detail;
+    if (typeof envelope.docs === 'string') detail.docs = envelope.docs;
+    if (typeof envelope.code === 'string' && envelope.code !== code) detail.canonical_code = envelope.code;
+    if (typeof envelope.reason === 'string') detail.reason = envelope.reason;
+    if (typeof envelope.why === 'string') detail.why = envelope.why;
+    if (envelope.fix && typeof envelope.fix === 'object' && !Array.isArray(envelope.fix)) detail.fix = envelope.fix as Record<string, unknown>;
+    if (Array.isArray(envelope.notices)) detail.notices = envelope.notices.filter(n => n && typeof n === 'object') as Array<Record<string, unknown>>;
+    if (envelope.contract_version === 1) detail.contract_version = 1;
+    if (isWriteReceipt(envelope.write_request)) detail.write_request = publicWriteReceipt(envelope.write_request);
+    if (isWriteErrorCode(envelope.write_error)) detail.write_error = envelope.write_error;
+  } catch { /* Older servers can return plain text; preserve existing code extraction. */ }
+  return detail;
+}
+
 function requireRemoteMcp(config: GBrainConfig | null): NonNullable<GBrainConfig['remote_mcp']> {
   if (!config?.remote_mcp) {
     throw new RemoteMcpError(
@@ -194,17 +306,24 @@ async function getAccessToken(config: GBrainConfig, force = false, signal?: Abor
     throw new RemoteMcpError(
       disco.reason === 'http' || disco.reason === 'parse' ? 'discovery' : 'network',
       `OAuth discovery failed: ${disco.message}`,
-      { ...(disco.status ? { status: disco.status } : {}), ...(disco.kind ? { kind: disco.kind } : {}), mcp_url: remote.mcp_url },
+      { ...(disco.status ? { status: disco.status } : {}), ...(disco.kind ? { kind: disco.kind } : {}), mcp_url: remote.mcp_url,
+        ...(disco.status_only ? { ...extractToolErrorDetail(JSON.stringify(disco.status_only)), retry_after_s: disco.retry_after_s } : {}) },
     );
   }
 
   const tokenRes = await mintClientCredentialsToken(disco.metadata.token_endpoint, remote.oauth_client_id, secret, { signal });
   signal?.throwIfAborted();
   if (!tokenRes.ok) {
+    // Discovery already succeeded, so a /token failure is never 'discovery'.
     throw new RemoteMcpError(
-      tokenRes.reason === 'auth' ? 'auth' : tokenRes.reason === 'network' ? 'network' : 'discovery',
+      tokenRes.reason === 'http' || tokenRes.reason === 'parse' ? 'token' : tokenRes.reason,
       `OAuth /token failed: ${tokenRes.message}`,
-      { ...(tokenRes.status ? { status: tokenRes.status } : {}), ...(tokenRes.kind ? { kind: tokenRes.kind } : {}), mcp_url: remote.mcp_url },
+      {
+        ...(tokenRes.status ? { status: tokenRes.status } : {}), ...(tokenRes.kind ? { kind: tokenRes.kind } : {}),
+        ...(tokenRes.retry_after_s !== undefined ? { retry_after_s: tokenRes.retry_after_s } : {}), mcp_url: remote.mcp_url,
+        ...(tokenRes.reason === 'rate_limited' ? rateLimitedMintDetail(tokenRes.retry_after_s) : {}),
+        ...(tokenRes.status_only ? extractToolErrorDetail(JSON.stringify(tokenRes.status_only)) : {}),
+      },
     );
   }
 
@@ -230,6 +349,9 @@ async function buildClient(mcpUrl: string, accessToken: string, signal?: AbortSi
     requestInit: {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
+        // Hosts serve full search/query rows to gbrain's own CLI (renderers,
+        // --explain). A row-shape hint only, never an authority claim.
+        [GBRAIN_CLIENT_HEADER]: `${GBRAIN_THIN_CLIENT_NAME}/${VERSION}`,
       },
     },
     fetch: (input, init) => fetch(input, {
@@ -238,7 +360,7 @@ async function buildClient(mcpUrl: string, accessToken: string, signal?: AbortSi
     }),
   });
   const client = new Client(
-    { name: 'gbrain-remote-cli', version: '1' },
+    { name: GBRAIN_THIN_CLIENT_NAME, version: '1' },
     { capabilities: {} },
   );
   try {
@@ -255,13 +377,31 @@ async function buildClient(mcpUrl: string, accessToken: string, signal?: AbortSi
 
 /**
  * Options for `callRemoteTool`. When absent, discovery/token requests retain
- * their own caps and MCP requests inherit the SDK's timeout.
+ * their own caps and MCP requests inherit the SDK's timeout. A `timeoutMs`
+ * also becomes the SDK request deadline (see buildMcpRequestOptions).
  */
 export interface CallRemoteToolOptions {
   /** Hard wall-clock cap for the whole call (token mint + tool call). Aborts on expiry. */
   timeoutMs?: number;
   /** External AbortSignal (e.g. SIGINT handler). Composed with the timeout. */
   signal?: AbortSignal;
+  /**
+   * #5232: keep a mutation's commit wait beyond the server's own bounded
+   * wait by replaying the identical request (same request_id) while it is
+   * pending. `timeoutMs` still bounds each exchange.
+   */
+  writeWaitMs?: number;
+}
+
+/**
+ * The SDK request options for one tool call. Passing only `signal` leaves the
+ * SDK's independent 60s default deadline in force, so a caller's longer
+ * timeout would still die at 60s; forward it.
+ *
+ * @internal Exported for test access (test/mcp-client-hardening.test.ts).
+ */
+export function buildMcpRequestOptions(opts: CallRemoteToolOptions, signal: AbortSignal): { signal: AbortSignal; timeout?: number } {
+  return { signal, ...(opts.timeoutMs !== undefined && opts.timeoutMs > 0 ? { timeout: opts.timeoutMs } : {}) };
 }
 
 /**
@@ -296,7 +436,8 @@ export function buildAbortController(opts: CallRemoteToolOptions): { signal: Abo
 
 /**
  * Call an MCP tool on the remote server. Handles auth refresh on 401 once.
- * Returns the parsed `result` payload from the tool response.
+ * Returns the parsed `result` payload from the tool response. Mutation calls
+ * retain a generated request_id on args for refresh and caller retries.
  *
  * Throws RemoteMcpError on:
  *   - missing remote_mcp config
@@ -312,6 +453,15 @@ export async function callRemoteTool(
   opts: CallRemoteToolOptions = {},
 ): Promise<unknown> {
   const remote = requireRemoteMcp(config);
+  // Retain on the caller's object so transport refresh and caller retries use
+  // the same durable identity. Explicit malformed IDs still reach validation.
+  if (isPersistenceIpcMutation(toolName) && args.request_id === undefined && args.dry_run !== true) args.request_id = randomUUID();
+  if (opts.writeWaitMs !== undefined && isPersistenceIpcMutation(toolName) && args.dry_run !== true) {
+    const { writeWaitMs, ...exchange } = opts;
+    return replayWhilePending(() => callRemoteTool(config, toolName, args, exchange), writeWaitMs);
+  }
+  const requestId = isPersistenceIpcMutation(toolName) && isWriteRequestId(args.request_id) ? args.request_id : undefined;
+  let submitted = false;
 
   // v0.31.1 (CDX-4): wrap the WHOLE call in normalize-on-error so the
   // exhaustive switch on RemoteMcpError.reason at the dispatcher is sound.
@@ -330,19 +480,20 @@ export async function callRemoteTool(
       const client = await buildClient(remote.mcp_url, token, signal);
       try {
         signal.throwIfAborted();
-        const res = await client.callTool({ name: toolName, arguments: args }, undefined, { signal });
+        submitted = true;
+        const res = await client.callTool({ name: toolName, arguments: args }, undefined, buildMcpRequestOptions(opts, signal));
         if (res.isError) {
-          const message = Array.isArray(res.content)
-            ? res.content.map((c: unknown) => (c as { text?: string }).text ?? '').join('\n')
-            : 'unknown tool error';
+          // Agent contract v1: the envelope is content[0] alone. A notice
+          // block from a newer server never joins the body.
+          const first = Array.isArray(res.content) ? (res.content[0] as { text?: unknown } | undefined) : undefined;
+          const message = typeof first?.text === 'string' ? first.text : 'unknown tool error';
           // v0.31.1: extract structured error code (e.g. 'missing_scope') so
           // the dispatcher can produce a pinpoint hint instead of a generic
           // "tool error" message.
-          const code = extractToolErrorCode(message);
           throw new RemoteMcpError(
             'tool_error',
             `Remote tool ${toolName} failed: ${message}`,
-            { mcp_url: remote.mcp_url, ...(code ? { code } : {}) },
+            { mcp_url: remote.mcp_url, ...extractToolErrorDetail(message) },
           );
         }
         return res;
@@ -354,10 +505,14 @@ export async function callRemoteTool(
     try {
       return await tryCall(initialToken);
     } catch (e) {
+      // A response received before cleanup is authoritative even if closing
+      // the transport crosses the deadline. Preserve its receipt first.
+      if (e instanceof RemoteMcpError && e.detail?.write_request) throw e;
       // Application errors can contain arbitrary text (including client IDs
       // with "401"). Only a rejected HTTP request authorizes a replay.
       signal.throwIfAborted();
       if (!(e instanceof StreamableHTTPError) || e.code !== 401) throw e;
+      submitted = false; // This attempt was explicitly refused, not accepted.
       // Drop cached token and retry once with a fresh mint.
       tokenCache.delete(remote.mcp_url);
       let freshToken: string;
@@ -376,8 +531,10 @@ export async function callRemoteTool(
       try {
         return await tryCall(freshToken);
       } catch (e2) {
+        if (e2 instanceof RemoteMcpError && e2.detail?.write_request) throw e2;
         signal.throwIfAborted();
         if (e2 instanceof StreamableHTTPError && e2.code === 401) {
+          submitted = false;
           tokenCache.delete(remote.mcp_url);
           throw new RemoteMcpError(
             'auth_after_refresh',
@@ -392,7 +549,14 @@ export async function callRemoteTool(
     // CDX-4: this is the funnel. ANYTHING that escapes the inner block becomes
     // a typed RemoteMcpError. The dispatcher's exhaustive switch can rely on
     // this contract.
-    throw toRemoteMcpError(e, remote.mcp_url, signal);
+    const error = toRemoteMcpError(e, remote.mcp_url, signal);
+    if (!requestId) throw error;
+    throw new RemoteMcpError(error.reason, error.message, {
+      ...error.detail, request_id: requestId,
+      ...(!error.detail?.write_request && error.reason !== 'tool_error'
+        ? { submission_status: submitted ? 'unknown' as const : 'not_sent' as const } : {}),
+      ...(toolName === 'remember' || toolName === 'forget' ? { protocol_version: 1 as const } : {}),
+    });
   } finally {
     cleanup();
   }
@@ -425,6 +589,33 @@ export function unpackToolResult<T = unknown>(res: unknown): T {
 }
 
 /**
+ * Agent contract v1 notices on a SUCCESS result: `_meta.gbrain_notices`
+ * (rendered) when present, else the prefixed extra text blocks after
+ * content[0] (`[gbrain notice <code> kind=<kind>]` first line), for hosts
+ * that drop `_meta`. Old servers return none.
+ */
+export function extractNotices(res: unknown): Array<Record<string, unknown>> {
+  const meta = extractResponseMeta(res)?.gbrain_notices;
+  if (Array.isArray(meta)) return meta.filter(n => n && typeof n === 'object') as Array<Record<string, unknown>>;
+  const content = (res as { content?: unknown[] } | undefined)?.content;
+  const out: Array<Record<string, unknown>> = [];
+  for (const block of Array.isArray(content) ? content.slice(1) : []) {
+    const text = (block as { text?: unknown })?.text;
+    if (typeof text !== 'string' || !text.startsWith('[gbrain notice ')) continue;
+    const [head, ...rest] = text.split('\n');
+    const m = /^\[gbrain notice (\S+) kind=(\S+)\]$/.exec(head);
+    if (!m) continue;
+    const notice: Record<string, unknown> = { code: m[1], kind: m[2] };
+    for (const line of rest) {
+      const kv = /^(why|fix|next|user_message): (.*)$/.exec(line);
+      if (kv) notice[kv[1]] = kv[2];
+    }
+    out.push(notice);
+  }
+  return out;
+}
+
+/**
  * T15/FOV-1: read the response-level `_meta` from a tool-call envelope
  * (see docs/protocol/MCP_META_CHANNELS.md). Old servers simply lack the
  * field — callers must treat undefined as "no meta", never as an error.
@@ -435,4 +626,27 @@ export function extractResponseMeta(res: unknown): Record<string, unknown> | und
     return meta as Record<string, unknown>;
   }
   return undefined;
+}
+
+/**
+ * Params the server reported it ignored (WP3 warn mode): `_meta.warnings`
+ * entries with code `unknown_param`, plus the model-visible warning blocks
+ * after content[0] for transports that drop `_meta`. Empty for hosts that
+ * predate unknown-parameter warnings, which cannot be detected.
+ */
+export function ignoredRemoteParams(res: unknown): string[] {
+  const names = new Set<string>();
+  const warnings = extractResponseMeta(res)?.warnings;
+  if (Array.isArray(warnings)) {
+    for (const w of warnings as Array<{ code?: unknown; param?: unknown }>) {
+      if (w?.code === 'unknown_param' && typeof w.param === 'string') names.add(w.param);
+    }
+  }
+  const content = (res as { content?: unknown[] } | undefined)?.content;
+  for (const block of Array.isArray(content) ? content.slice(1) : []) {
+    const text = (block as { text?: unknown })?.text;
+    if (typeof text !== 'string') continue;
+    for (const m of text.matchAll(/^(?:why: )?warning: unknown parameter "([^"]+)" ignored/gm)) names.add(m[1]);
+  }
+  return [...names];
 }

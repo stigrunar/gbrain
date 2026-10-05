@@ -57,8 +57,10 @@ import {
   type WriteThroughResult,
 } from './write-through.ts';
 import { withPageLock } from './page-lock.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
 import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesystemLock } from './minions/source-filesystem.ts';
 import { findTimelineSplitIndex } from './markdown.ts';
+import { isMaterializedMarkerLine } from './timeline-marker.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
@@ -136,14 +138,14 @@ export interface RenderedTimelineEntry {
   /** Bullet line plus indented detail lines (when representable). */
   block: string;
   canonical: CanonicalTimelineTuple;
+  detail: string;
 }
 
 /**
  * Render one entry as a canonical source-first bullet and derive the tuple
  * the FS extractor will recover from it. Returns null when the rendered
  * block does not round-trip to exactly one entry with the requested date —
- * the caller then keeps the entry DB-only rather than writing a bullet that
- * would fragment or duplicate on the next sync.
+ * managed callers reject an entry that cannot be represented losslessly.
  */
 export function renderTimelineEntry(
   entry: TimelineEntryWriteInput,
@@ -169,18 +171,10 @@ export function renderTimelineEntry(
     return { date: entries[0].date, source: entries[0].source ?? '', summary: entries[0].summary };
   };
 
-  let block = [line, ...detailLines].join('\n');
-  let canonical = derive(block);
-  if (!canonical && detailLines.length > 0) {
-    // A detail line can carry its own `[Source: …, date]` citation that the
-    // extractor's Format 3 would file as a second entry. Keep detail out of
-    // the file in that case (it stays in the DB row) rather than planting a
-    // block that re-extracts to more than one entry.
-    block = line;
-    canonical = derive(block);
-  }
+  const block = [line, ...detailLines].join('\n');
+  const canonical = derive(block);
   if (!canonical) return null;
-  return { block, canonical };
+  return { block, canonical, detail: detailLines.map(line => line.trim()).join(' ') };
 }
 
 /** Line-anchored Format-1 bullet detector (date capture only). */
@@ -199,27 +193,10 @@ export function spliceTimelineBlock(timelineText: string, date: string, block: s
   if (!text.trim()) {
     return `## Timeline\n\n${block}`;
   }
-  const lines = text.split('\n');
-  const bullets: Array<{ index: number; date: string }> = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = BULLET_DATE_RE.exec(lines[i]);
-    if (m) bullets.push({ index: i, date: m[1] });
-  }
-  if (bullets.length === 0) {
-    return `${text}\n\n${block}`;
-  }
-  const descending = bullets.length >= 2 && bullets[0].date > bullets[bullets.length - 1].date;
-  let insertBefore = -1;
-  for (const b of bullets) {
-    if (descending ? b.date < date : b.date > date) {
-      insertBefore = b.index;
-      break;
-    }
-  }
-  if (insertBefore === -1) {
-    return `${text}\n${block}`;
-  }
-  return [...lines.slice(0, insertBefore), ...block.split('\n'), ...lines.slice(insertBefore)].join('\n');
+  // Use the same bullet-bounded splice for page snapshots and raw files, so
+  // legacy facts/takes sections after the final bullet remain outside it.
+  const sentinel = '<!-- timeline -->\n';
+  return spliceTimelineIntoFileText(`${sentinel}${text}`, date, block).slice(sentinel.length);
 }
 
 /** True for an indented continuation line (a bullet's detail lines). */
@@ -294,6 +271,8 @@ export function spliceTimelineIntoFileText(fileText: string, date: string, block
     }
     if (before !== -1) {
       insertAt = before;
+      // #5567: a materialized marker belongs to the bullet below it; never split the pair.
+      while (insertAt > sentinel + 1 && isMaterializedMarkerLine(lines[insertAt - 1])) insertAt--;
     } else {
       // After the LAST bullet, past its indented continuation (detail) lines.
       insertAt = bullets[bullets.length - 1].index + 1;
@@ -411,22 +390,24 @@ export async function writeTimelineEntryThrough(
         const newTimeline = sanitizeForJsonb(
           spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block),
         );
-        await engine.executeRaw(
-          `UPDATE pages SET timeline = $1, chunker_version = ${bodyWriteChunkVersion('pages.compiled_truth', '$1')}, updated_at = now()
-            WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
-          [newTimeline, slug, sourceId],
-        );
+        await maintenanceTransaction(engine, async tx => {
+          await tx.executeRaw(
+            `UPDATE pages SET timeline = $1, chunker_version = ${bodyWriteChunkVersion('pages.compiled_truth', '$1')}, updated_at = now()
+              WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
+            [newTimeline, slug, sourceId],
+          );
 
-        // Store the tuple the FS extractor recovers from the bullet just
-        // spliced in, so every later sync/rebuild re-extraction
-        // conflicts-no-ops instead of duplicating (#1856's dedup-tuple
-        // divergence).
-        await engine.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
-          date: rendered.canonical.date,
-          source: rendered.canonical.source,
-          summary: rendered.canonical.summary,
-          detail: entry.detail || '',
-        }, { sourceId, skipExistenceCheck: true });
+          // Store the tuple the FS extractor recovers from the bullet just
+          // spliced in, so every later sync/rebuild re-extraction
+          // conflicts-no-ops instead of duplicating (#1856's dedup-tuple
+          // divergence).
+          await tx.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
+            date: rendered.canonical.date,
+            source: rendered.canonical.source,
+            summary: rendered.canonical.summary,
+            detail: entry.detail || '',
+          }, { sourceId, skipExistenceCheck: true });
+        });
 
         // #2426 mirror (writePageThrough): on a durability-hardened repo,
         // commit the artifact so it reaches git. Best-effort — a commit

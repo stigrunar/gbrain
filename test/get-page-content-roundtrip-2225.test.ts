@@ -86,6 +86,33 @@ describe('get_page content round-trip (#2225)', () => {
     expect(page.timeline as string).toContain('Series A closed');
   }, 30_000);
 
+  test('content_only: the round-trip fields without the duplicated compiled_truth / timeline / frontmatter', async () => {
+    await putPage.handler(localCtx(), { slug: 'companies/contentonly-example', content: ORIGINAL });
+
+    const full = (await getPage.handler(localCtx(), { slug: 'companies/contentonly-example', include_content: true })) as Record<string, unknown>;
+    const lean = (await getPage.handler(localCtx(), { slug: 'companies/contentonly-example', include_content: true, content_only: true })) as Record<string, unknown>;
+    expect(lean.content).toBe(full.content);
+    expect(lean.revision).toBe(full.revision);
+    expect(lean.slug).toBe('companies/contentonly-example');
+    expect(lean.title).toBe('Acme Example');
+    for (const dup of ['compiled_truth', 'timeline', 'frontmatter']) expect(dup in lean).toBe(false);
+    expect(JSON.stringify(lean).length).toBeLessThan(JSON.stringify(full).length);
+
+    // The lean read is enough for a revision-checked round trip.
+    const edited = (lean.content as string).replace('42 employees', '44 employees');
+    await putPage.handler(localCtx(), { slug: 'companies/contentonly-example', content: edited, expected_revision: lean.revision });
+    const row = await engine.getPage('companies/contentonly-example', { sourceId: 'default' });
+    expect(row!.compiled_truth ?? '').toContain('44 employees');
+    expect(row!.timeline ?? '').toContain('Series A closed');
+  }, 30_000);
+
+  test('content_only without include_content is ignored (the default read shape is unchanged)', async () => {
+    await putPage.handler(localCtx(), { slug: 'companies/contentonly-ignored', content: ORIGINAL });
+    const page = (await getPage.handler(localCtx(), { slug: 'companies/contentonly-ignored', content_only: true })) as Record<string, unknown>;
+    expect('content' in page).toBe(false);
+    expect(page.compiled_truth as string).toContain('Acme builds widgets');
+  }, 30_000);
+
   test('naive get_page.content → put_page preserves pages.timeline', async () => {
     await putPage.handler(localCtx(), { slug: 'companies/roundtrip-example', content: ORIGINAL });
 
@@ -95,7 +122,7 @@ describe('get_page content round-trip (#2225)', () => {
     // The naive client edit: take `content` verbatim (or with a body edit
     // above the sentinel) and put it straight back.
     const edited = (before.content as string).replace('42 employees', '43 employees');
-    await putPage.handler(localCtx(), { slug: 'companies/roundtrip-example', content: edited });
+    await putPage.handler(localCtx(), { slug: 'companies/roundtrip-example', content: edited, expected_revision: before.revision });
 
     const row = await engine.getPage('companies/roundtrip-example', { sourceId: 'default' });
     expect(row).not.toBeNull();
@@ -120,7 +147,7 @@ ${page.compiled_truth as string}
 
 ${page.timeline as string}
 `;
-    await putPage.handler(localCtx(), { slug: 'companies/concat-example', content: naive });
+    await putPage.handler(localCtx(), { slug: 'companies/concat-example', content: naive, expected_revision: page.revision });
 
     const row = await engine.getPage('companies/concat-example', { sourceId: 'default' });
     expect(row!.timeline ?? '').toContain('Series A closed');

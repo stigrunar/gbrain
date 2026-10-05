@@ -14,7 +14,9 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
-import { hasDatabase, setupDB, teardownDB, getEngine, getConn } from './helpers.ts';
+import { hasDatabase, setupLegacyEmbeddingDB, teardownDB, getEngine, getConn } from './helpers.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
 
 // Mock embedBatch so embed phase doesn't call OpenAI.
 mock.module('../../src/core/embedding.ts', () => ({
@@ -66,7 +68,10 @@ describeE2E('E2E: gbrain dream CLI against real Postgres', () => {
   let repo: string;
 
   beforeAll(async () => {
-    await setupDB();
+    await setupLegacyEmbeddingDB();
+    // embedBatch is mocked above, but the embed phase's credential preflight
+    // reads the gateway env, and a failed phase now exits 1 (agent operator E4).
+    configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: { OPENAI_API_KEY: 'placeholder-key-embed-is-mocked' } });
     repo = makeGitRepo();
   }, 30_000);
 

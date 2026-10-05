@@ -36,7 +36,8 @@
  *    GBRAIN_DIRECT_DATABASE_URL override, ddl()/bulk() share the read pool.
  */
 
-import postgres from 'postgres';
+import postgres from '#postgres'
+import { traceSqlOptions } from './sql-trace.ts';
 import { resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, endPoolBounded } from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
@@ -71,6 +72,8 @@ export interface ConnectionManagerOpts {
    * not call .end() on disconnect(). Default false (we own both pools).
    */
   readPoolOwnedExternally?: boolean;
+  /** #5730: told when the driver discards a pooled connection left inside a transaction. */
+  onpoisoned?: (pool: 'read' | 'direct', status: string) => void;
 }
 
 /** Default direct-pool size (P1 raised from 2 to 3). Override via env. */
@@ -303,9 +306,13 @@ export class ConnectionManager {
     }
   }
 
-  /** Whether dual-pool routing is active (false on non-Supabase or kill-switch). */
+  /** Known poolers derive their route; other deployments require a valid explicit override. */
   isDualPoolActive(): boolean {
-    return this._isSupabase && !this._killSwitch && !!this._directUrl;
+    if (this._killSwitch || !this._directUrl) return false;
+    if (this._isSupabase) return true;
+    if (this._directUrlAutoDerived) return false;
+    try { return ['postgres:', 'postgresql:'].includes(new URL(this._directUrl).protocol); }
+    catch { return false; }
   }
 
   isSupabase(): boolean { return this._isSupabase; }
@@ -344,12 +351,14 @@ export class ConnectionManager {
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),
       types: { bigint: postgres.BigInt },
+      onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+      onpoisoned: (status: string) => this.opts.onpoisoned?.('read', status),
     };
     const timeouts = resolveSessionTimeouts();
     if (Object.keys(timeouts).length > 0) opts.connection = timeouts;
     const prepare = resolvePrepare(this.opts.url);
     if (typeof prepare === 'boolean') opts.prepare = prepare;
-    this._readPool = postgres(this.opts.url, opts);
+    this._readPool = postgres(this.opts.url, traceSqlOptions(opts, 'read'));
     logConnectionEvent({ pool: 'read', op: 'init' });
     return this._readPool;
   }
@@ -367,8 +376,8 @@ export class ConnectionManager {
   }
 
   /**
-   * Acquire (and lazy-init) the direct DDL pool. When kill-switch is active
-   * or non-Supabase, returns the read pool (single-pool fallback).
+   * Acquire (and lazy-init) the direct DDL pool. The kill switch or an
+   * unconfigured direct route returns the read pool (single-pool fallback).
    *
    * A1: lazy init wraps in a cached Promise<Sql> so concurrent first-callers
    * await the same init instead of racing two pool constructions.
@@ -493,6 +502,8 @@ export class ConnectionManager {
       // Always use prepared statements on the direct pool — no PgBouncer
       // here, so the prepare-cache invalidation issue doesn't apply.
       prepare: true,
+      onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+      onpoisoned: (status: string) => this.opts.onpoisoned?.('direct', status),
       // Apply DDL session GUCs as connection startup parameters (durable
       // through any intermediary pooling layer, same trick as
       // resolveSessionTimeouts).
@@ -505,7 +516,7 @@ export class ConnectionManager {
     const t0 = Date.now();
     let pool: Sql | null = null;
     try {
-      pool = postgres(this._directUrl, opts);
+      pool = postgres(this._directUrl, traceSqlOptions(opts, 'direct'));
       // Probe to validate connectivity early.
       await pool`SELECT 1`;
       logConnectionEvent({
@@ -584,10 +595,10 @@ export class ConnectionManager {
     direct_pool_size: number;
   } {
     let mode: 'split' | 'single (kill-switch)' | 'single (non-supabase)' | 'single (no-direct-url)';
-    if (!this._isSupabase) mode = 'single (non-supabase)';
-    else if (this._killSwitch) mode = 'single (kill-switch)';
-    else if (!this._directUrl) mode = 'single (no-direct-url)';
-    else mode = 'split';
+    if (this.isDualPoolActive()) mode = 'split';
+    else if (this._killSwitch && (this._isSupabase || this._directUrl)) mode = 'single (kill-switch)';
+    else if (!this._isSupabase) mode = 'single (non-supabase)';
+    else mode = 'single (no-direct-url)';
     return {
       mode,
       direct_host: this._directUrl ? this.hostOnly(this._directUrl) : undefined,

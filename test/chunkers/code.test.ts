@@ -10,8 +10,8 @@ import { describe, test, expect } from 'bun:test';
 import { chunkCodeText, detectCodeLanguage, CHUNKER_VERSION } from '../../src/core/chunkers/code.ts';
 
 describe('CHUNKER_VERSION', () => {
-  test('#3821 decorated definitions and #4511 definition-preserving merge guard require v6', () => {
-    expect(CHUNKER_VERSION).toBe(6);
+  test('N13-1 function-valued declarations bumped to 8 (after decorated definitions and Bash grammar)', () => {
+    expect(CHUNKER_VERSION).toBe(8);
   });
 });
 

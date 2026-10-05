@@ -256,8 +256,11 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
 
     expect(exitCode).not.toBe(2);
     expect(stdout).toContain('"gate":"below_floor"');
+    // #4684: the gate object is nested in the ONE envelope, never a second document.
+    expect(jsonLines(stdout)).toHaveLength(1);
     const final = jsonLines(stdout).find((line) => line.schema_version === 1 && Array.isArray(line.sources));
     expect(final).toBeDefined();
+    expect(final!.cost_gate).toMatchObject({ gate: 'below_floor', mode: 'inline' });
     expect(final!.sources).toEqual([
       expect.objectContaining({
         source_id: 'vault',
@@ -374,8 +377,10 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
       console.log = origLog;
     }
 
-    const notice = jsonLines(out.join('\n')).find((line) => line.gate === 'manual_drain_required');
-    expect(notice).toMatchObject({
+    // #4684: under --json the gate returns its notice for the envelope instead
+    // of printing a second top-level document.
+    expect(out).toHaveLength(0);
+    expect(plan!.costGate).toMatchObject({
       status: 'manual_drain_required',
       workerSurface: 'worker_backed',
       reason: 'auto_submit_disabled',
@@ -579,16 +584,59 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
 
     expect(exitCode).not.toBe(2);
     expect(stdout).toContain('"gate":"below_floor"');
+    // #4684: one top-level JSON document; the gate rides inside it as cost_gate.
+    expect(jsonLines(stdout)).toHaveLength(1);
     const final = jsonLines(stdout).find((line) => line.schema_version === 1 && line.source_id === 'vault');
     expect(final).toMatchObject({
       sync_status: 'synced',
       added: 101,
       embedded: 0,
+      cost_gate: { gate: 'below_floor', mode: 'inline' },
       embed_backfill: {
         status: 'manual_drain_required',
         command: 'gbrain embed --stale --source vault',
       },
     });
+    await expectNoEmbedBackfillRow();
+  }, 120_000);
+
+  // #5386: a worker-backed single-source sync delivers its intrinsic large_sync
+  // deferral as a queued backfill, like --all, instead of stranding the chunks.
+  test('single-source worker-backed large incremental deferral submits the backfill (#5386)', async () => {
+    const workerBackedEngine = asWorkerBacked(engine);
+    await runSources(workerBackedEngine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    await engine.executeRaw(
+      `UPDATE sources SET last_commit = $1, chunker_version = $2 WHERE id = 'vault'`,
+      [headSha, String(CHUNKER_VERSION)],
+    );
+    await engine.setConfig('sync.cost_gate_min_usd', '1000');
+    commitLargeIncrementalDrop();
+
+    const { exitCode, stdout } = await runSyncCaptured(['--source', 'vault', '--json', '--no-pull'], workerBackedEngine);
+
+    expect(exitCode).not.toBe(2);
+    const final = jsonLines(stdout).find((line) => line.schema_version === 1 && line.source_id === 'vault');
+    expect(final).toMatchObject({ sync_status: 'synced', added: 101, embedded: 0, embed_backfill: { status: 'queued' } });
+    const rows = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM minion_jobs WHERE name = 'embed-backfill'`);
+    expect(Number(rows[0]?.n ?? 0)).toBe(1);
+    await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'embed-backfill'`);
+  }, 120_000);
+
+  test('single-source worker-backed large incremental sync with --no-embed submits no backfill', async () => {
+    const workerBackedEngine = asWorkerBacked(engine);
+    await runSources(workerBackedEngine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    await engine.executeRaw(
+      `UPDATE sources SET last_commit = $1, chunker_version = $2 WHERE id = 'vault'`,
+      [headSha, String(CHUNKER_VERSION)],
+    );
+    commitLargeIncrementalDrop();
+
+    const { exitCode, stdout } = await runSyncCaptured(['--source', 'vault', '--json', '--no-pull', '--no-embed'], workerBackedEngine);
+
+    expect(exitCode).not.toBe(2);
+    const final = jsonLines(stdout).find((line) => line.schema_version === 1 && line.source_id === 'vault');
+    expect(final).toMatchObject({ sync_status: 'synced', added: 101, embedded: 0 });
+    expect(final?.embed_backfill).toBeUndefined();
     await expectNoEmbedBackfillRow();
   }, 120_000);
 

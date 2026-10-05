@@ -125,10 +125,11 @@ describe('Layer 13 E2 — runReindexCode', () => {
     const result = await runReindexCode(engine, { noEmbed: true });
     expect(result.status).toBe('ok');
     expect(result.codePages).toBe(5);
-    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.reindexed).toBe(4);
+    expect(result.skipped).toBe(0);
     expect(result.failures?.some(f => f.slug === 'src-empty-init-py')).not.toBe(true);
     // src-bad-ts has no frontmatter.file → fails cleanly.
-    expect(result.failed).toBeGreaterThanOrEqual(1);
+    expect(result.failed).toBe(1);
     expect(result.failures).toBeDefined();
     expect(result.failures!.some(f => f.slug === 'src-bad-ts')).toBe(true);
 

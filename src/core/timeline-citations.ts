@@ -22,6 +22,7 @@ function citationParagraphs(
 ): CitationParagraph[] {
   const paragraphs: CitationParagraph[] = [];
   let lines: string[] = [];
+  let skippedBlock = false;
 
   const flush = () => {
     if (lines.length === 0) return;
@@ -36,8 +37,12 @@ function citationParagraphs(
     }
     if (opts.skipLine?.(line)) {
       flush();
+      skippedBlock = true;
       continue;
     }
+    // Continuations belong to the already-indexed bullet, including citations.
+    if (skippedBlock && /^\s/.test(line)) { flush(); continue; }
+    skippedBlock = false;
     if (lines.length > 0 && startsMarkdownBlock(line)) flush();
     lines.push(line);
   }
@@ -55,7 +60,7 @@ export function parseInlineCitationTimelineEntries(
     const matches = [...paragraph.text.matchAll(CITATION_TIMELINE_RE)];
     if (matches.length === 0) continue;
     const summary = paragraph.text
-      .replace(/\[Source:[^\]]*\]/g, '')
+      .replace(/\[Source:[^\]]*\](?:\((?:[^()]|\([^()]*\))*\))?/g, '')
       .replace(/^[-*>#\s]+/, '')
       .replace(/\s+/g, ' ')
       .trim()
@@ -78,6 +83,6 @@ function isValidDate(s: string): boolean {
   const [y, mo, d] = s.split('-').map(Number);
   if (mo < 1 || mo > 12) return false;
   if (d < 1 || d > 31) return false;
-  const dt = new Date(Date.UTC(y, mo - 1, d));
+  const dt = new Date(new Date(0).setUTCFullYear(y, mo - 1, d)); // not Date.UTC: it maps years 0-99 to 1900-1999
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
 }
