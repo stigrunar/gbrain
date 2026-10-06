@@ -201,8 +201,8 @@ export interface GBrainConfig {
       /** Enable the nightly probe in the autopilot loop. Defaults to false. */
       enabled?: boolean;
       /**
-       * Cost cap (USD) per probe invocation. Defaults to 5.
-       * Worst case: 5 × 30 nights ≈ $150/month per brain.
+       * Run-level cap (USD) over every paid call of one probe run (LongMemEval
+       * and judges). Default 5; a set value is a user cap (unpriced → no_pricing).
        */
       max_usd?: number;
     };
@@ -554,6 +554,8 @@ export interface GBrainConfig {
      * over this file slot. Always bounded by the server ceiling (D2).
      */
     default_surface_dcr?: 'verbs' | 'starter' | 'full';
+    /** Tools listed to agents (callable set unchanged; request_tools reaches the rest). Dual-plane, DB > file. */
+    advertised_surface?: 'verbs' | 'starter' | 'full';
     /** Search/query row shape for remote MCP callers: 'lean' (default) | 'full'. Dual-plane, DB > file. */
     result_rows?: 'lean' | 'full';
     /** Stdio `request_tools {surface}` widens the session's tool surface (default true). Dual-plane, DB > file. */
@@ -1271,6 +1273,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'agent.use_gateway_loop',
   // #2778: per-turn output-token cap for the subagent loop (default 8192).
   'agent.max_output_tokens',
+  // #4921: subagent per-turn chat timeout (minions/handler-timeouts.ts, default 30 min).
+  'ai.chat.per_turn_timeout_ms',
   // File-plane bootstrap hook-lane keys (routed to ~/.gbrain/config.json by
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',
@@ -1411,7 +1415,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.contextual_synopsis',
   'models.chat',
   'models.brainstorm.judge',
-  'models.eval.longmemeval',
+  'models.eval.longmemeval', 'models.eval.cross_modal.slot_a', 'models.eval.cross_modal.slot_b', 'models.eval.cross_modal.slot_c', // #5872 D12 probe judge slots
   'facts.extraction_model',
   // Brain-wide kill switch for fact extraction, read by
   // src/core/facts/extract.ts:isFactsExtractionEnabled and honored by
@@ -1487,6 +1491,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.synthesize.mode',
   'dream.synthesize.link_manifest',
   'dream.synthesize.quote_verify',
+  'dream.quote_verify',
+  'think.quote_verify',
   'dream.synthesize.inline_concurrency',
   // #4152 triage knobs. The triage model's preferred key is
   // `models.dream.triage` (models.* prefix, registered via the models.dream.*
@@ -1520,6 +1526,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4348: IANA timezone that owns the dream-cycle calendar day (summary
   // bucketing). Unset → host timezone → UTC. Validated at set time.
   'cycle.timezone',
+  'cycle.consolidate.cluster_threshold', // #5363: (0, 1], default 0.85; read + validated in cycle/phases/consolidate.ts
   // A11: IANA timezone for offset-less frontmatter datetimes in effective_date.
   // Unset → UTC (date-only values are always UTC calendar dates). Validated at set time.
   'brain.timezone',
@@ -1585,8 +1592,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // reconcile-links, and sweep. The documented off-switch is `gbrain config
   // set auto_link false` — same unregistered-key class as auto_chronicle.
   'auto_link',
-  // Entity mention index (core/mentions/policy.ts): off switch, +type/-type linkable types, names never linked.
-  'mentions.auto_link', 'mentions.entity_types', 'mentions.ignore',
+  // Entity mention index (core/mentions/policy.ts): off switch, +type/-type linkable types, names never linked, pages never linked (#5829).
+  'mentions.auto_link', 'mentions.entity_types', 'mentions.ignore', 'mentions.exclude_slugs',
   // #4987: the write-path timeline extractor's off switch (read by
   // isAutoTimelineEnabled); registered so `gbrain config set auto_timeline off`
   // works without --force, as the compiled-truth guide documents.
@@ -1621,6 +1628,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.bulk',
   'sync.bulk_size',
   'sync.bulk_max_txn_ms',
+  'sync.lanes',
   // Persisted indexing scope (comma/newline-separated glob list; trailing '/'
   // normalizes to a '/**' subtree glob). Read best-effort at the top of
   // performSyncInner and UNIONED with any per-call --exclude so internal

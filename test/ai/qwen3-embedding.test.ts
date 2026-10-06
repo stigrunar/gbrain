@@ -1,11 +1,17 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   __setEmbedTransportForTests,
   configureGateway,
   embed,
   embedQuery,
   resetGateway,
+  withBudgetTracker,
 } from '../../src/core/ai/gateway.ts';
+import { BudgetTracker } from '../../src/core/budget/budget-tracker.ts';
+import { withAIInvocationGuard } from '../../src/core/ai/invocation-guard.ts';
 import {
   OLLAMA_QWEN3_QUERY_PREFIX,
   isOllamaQwen3Embedding06B,
@@ -49,6 +55,65 @@ describe('Ollama Qwen3 exact model policy', () => {
 });
 
 describe('gateway integration', () => {
+  // Existing tests cover Qwen transport and chat reservation identity separately.
+  // This protects embedding admission/settlement over the actual Qwen payload:
+  // truncation, raw-query estimates, or a lost reservation id must fail it.
+  // It uses existing transport/guard seams and a temporary budget audit only.
+  test('plans and meters full Qwen inputs and settles each reservation by id', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-qwen-budget-'));
+    try {
+      for (const inputType of ['document', 'query'] as const) {
+        configureGateway({
+          embedding_model: 'ollama:qwen3-embedding:0.6b',
+          embedding_dimensions: 768,
+          env: { GBRAIN_EMBED_MAX_BATCH_TOKENS: '5400' },
+        });
+        const texts = ['界'.repeat(9000), 'd'.repeat(9000)];
+        const transported = texts.map(t => inputType === 'query' ? `${OLLAMA_QWEN3_QUERY_PREFIX}${t}` : t);
+        const estimatedTokens = Math.ceil(transported.reduce((sum, t) => sum + t.length, 0) / 4);
+        const auditPath = join(scratch, `${inputType}.jsonl`);
+        const tracker = new BudgetTracker({
+          label: 'test.qwen', auditPath, maxCostUsd: 0.01,
+          // Nonzero fixture pricing makes a leaked hold block the second call.
+          pricingOverrides: { 'ollama:qwen3-embedding:0.6b': { input: 1, output: 0 } },
+        });
+        const batches: string[][] = [];
+        const guardCeilings: Array<number | undefined> = [];
+        __setEmbedTransportForTests((async ({ values }: any) => {
+          batches.push([...values]);
+          return { embeddings: values.map(() => vector768()) }; // no usage: exercise fallback estimate
+        }) as any);
+
+        await withBudgetTracker(tracker, () => withAIInvocationGuard(async call => {
+          guardCeilings.push(call.maxInputTokens);
+          return { settle: async () => {} };
+        }, async () => {
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const vectors = await embed(texts, { inputType });
+            expect(vectors.map(v => v.length)).toEqual([768, 768]);
+          }
+        }));
+
+        expect(batches).toEqual([...transported, ...transported].map(t => [t]));
+        expect(guardCeilings).toEqual([...transported, ...transported].map(t => Buffer.byteLength(t, 'utf8')));
+        expect(tracker.totalSpent).toBeCloseTo(2 * estimatedTokens / 1_000_000, 12);
+        expect(tracker.snapshot().callsRecorded).toBe(2);
+        const audit = readFileSync(auditPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(audit.map(row => row.event)).toEqual(['reserve', 'record', 'reserve', 'record']);
+        for (const i of [0, 2]) {
+          expect(audit[i].reservation).toBeString();
+          expect(audit[i + 1].reservation).toBe(audit[i].reservation);
+          expect(audit[i].projected_cost_usd).toBeCloseTo(estimatedTokens / 1_000_000, 12);
+          expect(audit[i + 1].input_tokens).toBe(estimatedTokens);
+          expect(audit[i + 1].embedding_dims).toBe(768);
+        }
+        expect(audit[0].reservation).not.toBe(audit[2].reservation);
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   test('does not client-truncate Qwen3 document input', async () => {
     configureQwen3();
     let valuesSeen: string[] = [];
