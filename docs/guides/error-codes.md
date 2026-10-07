@@ -16,6 +16,7 @@ Under contract v1 an `error` value never changes. Where a surface sends a legacy
 | `error` (frozen) | `code` (canonical) | Meaning |
 |---|---|---|
 | `permission_denied` | `insufficient_scope` | The connection lacks the OAuth scope the operation requires. |
+| `invalid_params` | `invalid_fence` | A facts or takes fence in the page cannot be imported without dropping or guessing rows, so the page (or the file) was not written. |
 | `invalid_params` | `not_found` | The requested resource does not exist or is not visible to this caller. |
 | `page_identity_changed` | `page_not_found` | No page with that slug exists in the selected source. |
 | `permission_denied` | `trusted_local_only` | The operation runs only from the trusted local CLI on the brain host; no MCP connection can call it. |
@@ -559,6 +560,46 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | The content-sanity gate rejected the content because the operator set `content_sanity.junk_disposition` to `reject`. | A junk-pattern or operator-literal hit is refused instead of quarantined under that setting, so the page was not written. The same content refuses on every retry. | Remove the matched junk from the file, or switch `content_sanity.junk_disposition` back to `quarantine` (a user decision), then import it again. | agent | `repeat the read that failed` | 1 | no |
 
+### core_budget_exceeded
+
+<a id="core_budget_exceeded"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The write would push always-loaded core memory over its brain-wide character budget or page limit. | Core pages enter every session's prompt in every harness, so their total size is capped on the write path. | Correct the request using the message above, then retry. Run: gbrain core status --json | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/core-memory.md#budget](../../docs/guides/core-memory.md#budget)
+
+### core_delete_owner_only
+
+<a id="core_delete_owner_only"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A remote caller tried to delete an always-loaded core page; only the owner can remove pages from core. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/core-memory.md#owner-only](../../docs/guides/core-memory.md#owner-only)
+
+### core_mark_owner_only
+
+<a id="core_mark_owner_only"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A remote caller tried to change always_load or core_priority; only the owner designates core pages. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/core-memory.md#owner-only](../../docs/guides/core-memory.md#owner-only)
+
+### core_remote_edit_refused
+
+<a id="core_remote_edit_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Remote edits to always-loaded core pages are refused by memory.core.remote_edit. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/core-memory.md#remote-edits](../../docs/guides/core-memory.md#remote-edits)
+
 ### cost_cap_exceeded
 
 <a id="cost_cap_exceeded"></a>
@@ -901,6 +942,16 @@ More: [docs/guides/repair.md#file-removed-during-scan](../../docs/guides/repair.
 |---|---|---|---|---|---|---|
 | The file is over the import size limit (5 MB for Markdown and code, 10 MiB for any sync read), so it was not imported. | Size limits bound parsing, chunking and embedding cost. The same bytes refuse on every retry. | Split the file into smaller files, or leave it out of the source (sync.exclude), then sync or import again. | agent | `repeat the read that failed` | 1 | no |
 
+### fix_not_writable
+
+<a id="fix_not_writable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A gbrain lint fix was not applied because the file refused the write (EACCES, EPERM or EROFS); the file was left unchanged. | Lint repairs files in place, and this file's permissions or a read-only mount stopped the write; lint reports it and continues with the remaining files. | Make the file writable by the user running gbrain, or pass its directory or file name to gbrain lint --exclude, then lint again. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/repair.md#fix-not-writable](../../docs/guides/repair.md#fix-not-writable)
+
 ### follow_approval_required
 
 <a id="follow_approval_required"></a>
@@ -1234,6 +1285,18 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Invalid connector text. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### invalid_fence
+
+<a id="invalid_fence"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A facts or takes fence in the page cannot be imported without dropping or guessing rows, so the page (or the file) was not written. | Facts and takes fences are the page's structured rows. Importing a fence that does not parse, repeats a marker or reuses a row number would silently drop or renumber rows, so coordinated writers refuse it and managed sync holds the one file while the rest of the source syncs. | A refused write: fix the fence the message names (fence, section and rows; the reason says what is wrong) and send the page again with a new request_id, or write rows with remember / takes_add. A held file or stored page: the maintenance run repairs it; preview it now with gbrain repair fences --source <id> on the brain host. | agent | `repeat the read that failed` | 1 | no |
+
+Reasons: `header_unmapped`, `no_header`, `row_before_header`, `short_row`, `extra_cells`, `claim_split`, `holder_unresolved`, `missing_begin`, `split_rows`, `unclosed_trailing_content`, `marker_near_miss`, `repeated_marker`, `takes_in_facts`, `superseded_ambiguous`, `enum_unmapped`, `weight_missing`, `holder_missing`, `confidence_out_of_range`, `claim_value_invalid`, `takes_kind_unsupported`, `unparseable`, `row_collision`, `quoted_fence_rows`, `stored_row_collision`, `withdrawn_claim_in_malformed_fence`, `target_fence_malformed`, `prepare_time`, `normalizer_failed`, `llm_unavailable`, `llm_empty`, `llm_refused`, `llm_malformed`, `llm_truncated`, `llm_declined`, `llm_disabled`, `no_measured_model`, `budget_exhausted`, `no_pricing`, `ledger_unavailable`, `owner_unavailable`, `owner_cli_required`, `sync_in_progress`, `time_budget`, `changed_since_read`, `changed_since_preview`, `still_invalid`, `claim_changed`, `row_number_changed`, `visibility_loosened`, `row_count_changed`, `cell_changed`, `protection_loosened`.
+
+More: [docs/guides/write-refusals.md#invalid_fence](../../docs/guides/write-refusals.md#invalid_fence)
 
 ### invalid_frontmatter
 

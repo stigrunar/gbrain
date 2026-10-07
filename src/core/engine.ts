@@ -1,4 +1,5 @@
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
+import type { GetVersionsOpts, PageVersionRows } from './page-state/version-types.ts';
 import type { LinkReadScope } from './link-validity.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
 import type { DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
@@ -539,7 +540,16 @@ export interface FactRow {
   fact_fingerprint?: string;
   /** Set by `listFactsKeyset`: created_at at the column's microsecond precision (ISO UTC). */
   created_at_iso?: string;
+  /** Who asserted the claim (migration v215); null when attribution is unavailable. */
+  attributed_to?: FactAttribution | null;
 }
+
+/**
+ * Who asserted a saved fact: the user, the assistant (a recommendation, answer
+ * or plan it gave), or a named third party. Never whether the claim is true or
+ * was accepted. NULL means attribution is unavailable.
+ */
+export type FactAttribution = 'user' | 'assistant' | 'other';
 
 /** Input for insertFact. source_id supplied via the ctx arg. */
 export interface NewFact {
@@ -585,6 +595,8 @@ export interface NewFact {
    * set this — leaving it undefined preserves pre-v0.40 behavior.
    */
   event_type?: string | null;
+  /** Speaker attribution (migration v215). Undefined/null → NULL (unavailable). */
+  attributed_to?: FactAttribution | null;
 }
 
 /** Options shared by list-facts methods. */
@@ -2258,13 +2270,15 @@ export interface BrainEngine {
    * Find candidate duplicates for a new fact within a source+entity bucket.
    * Entity-prefilter is mandatory (bounds the contradiction-classifier blast
    * radius). Hard cap k=5 by default. Embedding-cosine when both sides have
-   * embeddings; recency fallback otherwise.
+   * embeddings; recency fallback otherwise. `attributedTo` (the new fact's
+   * speaker) drops rows a different known speaker asserted before the k cap;
+   * NULL rows stay candidates.
    */
   findCandidateDuplicates(
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: FactAttribution | null },
   ): Promise<FactRow[]>;
 
   /**
@@ -2307,7 +2321,7 @@ export interface BrainEngine {
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
    */
-  getVersions(slug: string, opts?: PageReadScope): Promise<PageVersion[]>;
+  getVersions<B extends boolean = true>(slug: string, opts?: GetVersionsOpts<B>): Promise<PageVersionRows<B>>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the

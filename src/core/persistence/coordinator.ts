@@ -17,11 +17,13 @@ import { clearResolvedRecovery, completeWrite, getWriteRequestById, lockCounters
 import { isTerminal, principalKey, requestPrincipal, recoveryFiles, type FileRecoveryRecord, type RecoveryRecord, type WriteRequest } from './model.ts';
 import type { NativeLockHandle } from './native-lock.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { lockCoreSources } from './core-guard.ts';
 import { requestAttribution } from './attribution.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
@@ -31,10 +33,14 @@ import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, pub
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { databaseRefusal, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { fenceFailureDetail } from '../fence-repair/refusal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
+import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
+  /** Always-loaded core writes: source rows locked FOR UPDATE in id order (core-guard.ts lockCoreSources). */
+  exclusiveSources?: readonly string[];
   observedRevision: string | null;
   additionalPageKeys?: readonly {sourceId:string;slug:string}[];
   noop?: boolean;
@@ -57,8 +63,11 @@ interface PreparedMutationBase {
   postimage?: PageSnapshot | null;
   validate?(tx: BrainEngine): Promise<void>;
 }
-/** A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700. */
-export type PageMutationFile = MutationFile & { publishMode?: number };
+/**
+ * A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700.
+ * `commit` (trusted local preparers only) rides the Git effect into the commit message.
+ */
+export type PageMutationFile = MutationFile & { publishMode?: number; commit?: GitCommitNote };
 export type PreparedMutation = PreparedMutationBase & (
   | { target?: 'page'; file?: PageMutationFile; files?: never }
   | { target: 'skill_bundle'; file?: never; files: MutationFile[]; validate(tx: BrainEngine): Promise<void> }
@@ -109,7 +118,11 @@ function publishFile(file: PageMutationFile, stagingPath?: string, afterStagingF
 // its own recovery record and native root capability.
 export { fileHash as persistenceFileHash, publishFile as publishPersistenceFile };
 function requestError(error: unknown): PublicationFailure {
-  if (error instanceof OperationError) return { code: error.code, message: error.message };
+  if (error instanceof OperationError) {
+    // #6188: a typed fence refusal keeps its location in the bounded detail, which outlives receipt compaction.
+    const fence = fenceFailureDetail(error);
+    return { code: error.code, message: error.message, ...(fence ? { detail: fence } : {}) };
+  }
   const refusal = databaseRefusal(error);
   if (refusal) return refusal;
   const code = (error as { code?: string })?.code;
@@ -272,7 +285,8 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
     const done = await engine.transaction(async tx => {
       await declareDurablePersistence(tx);
       const liveBinding = await guardOwnership(tx, row, hostId);
-      if (prepared.sourceExclusive) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
+      if (prepared.sourceExclusive && !prepared.exclusiveSources?.length) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
+      if (prepared.exclusiveSources?.length) await lockCoreSources(tx, prepared.sourceExclusive ? [row.source_id, ...prepared.exclusiveSources] : prepared.exclusiveSources);
       if (binding && String(liveBinding?.owner_epoch) !== String(binding.owner_epoch)) throw opError('owner_unavailable', 'Owner epoch changed before publication.',
         `Source ${row.source_id}'s canonical owner changed (a transfer or re-claim) after request ${row.request_id} was prepared, so this host published nothing for it. Inspect the owner and the request before resubmitting; do not claim or transfer the source to push this write through.`,
         { fix: ownerStatusFix(row.source_id) });
@@ -330,6 +344,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
+      await recordPublicationFenceTrend(tx, row, outcome);
       await queuePublicationEffects(tx, row, final, outcome, prepared);
       await hooks.boundary?.('before_commit', row);
       const committed = await completeWrite(tx, current, 'committed', outcome, undefined, current);

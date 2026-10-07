@@ -216,6 +216,13 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/push-context.md",
       },
       {
+        title: "docs/guides/time-aware-recall.md",
+        description:
+          "Time-aware recall in `gbrain think`: the current date in brain.timezone (or `--reference-date`) and content dates on each page block, with the measured accuracy gain.",
+        path: "docs/guides/time-aware-recall.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/evidence-delivery.md",
         description:
           "Evidence delivery (`return_unit`): window / section / page / auto evidence instead of chunks on search, query, recall and think, packed into a token budget; response fields, fallback codes, authorization guarantees, latency, and the frozen-hit `assemble_evidence` interface for evals.",
@@ -303,6 +310,13 @@ export const SECTIONS: DocSection[] = [
         description:
           "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) and held-file content refusals (invalid_frontmatter and its reasons, frontmatter_slug_conflict, file_too_large, content_rejected, rename_held, sync_parser_regression) with the exact recovery command. Every refusal's `docs` field links its row directly.",
         path: "docs/guides/write-refusals.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/fence-format.md",
+        description:
+          "Facts and takes fence format, generated from the parser: markers, columns and layouts, allowed values, holders, row-number rules, one valid example per fence, what gbrain fixes by itself and what it never guesses, and the repair gates.",
+        path: "docs/guides/fence-format.md",
         includeInFull: false,
       },
       {

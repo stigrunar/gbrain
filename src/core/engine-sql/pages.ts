@@ -14,13 +14,15 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import type { DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow } from '../types.ts';
-import type { Page, PageInput, PageFilters, PageVersion, StalePageRow } from '../types.ts';
+import type { Page, PageInput, PageFilters, StalePageRow } from '../types.ts';
+import type { GetVersionsOpts, PageVersionRows } from '../page-state/version-types.ts';
 import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
+import { quarantineFilterFragment } from '../quarantine.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
@@ -241,7 +243,7 @@ export async function restorePage(exec: SqlExecutor, slug: string, opts?: { sour
     const sourceId = opts?.sourceId;
     const sourceCondition = sourceId ? sqlFragment`AND source_id = ${sourceId}` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      UPDATE pages SET deleted_at = NULL
+      UPDATE pages SET deleted_at = NULL, updated_at = now()
       WHERE slug = ${slug} AND deleted_at IS NOT NULL ${sourceCondition}
       RETURNING slug
     `);
@@ -650,6 +652,19 @@ export async function resolveSlugs(
 // ── v0.42.7 (#1696): link/timeline extraction freshness watermark ──
 
 /**
+ * Origins of wanted links whose target now exists: a live page with the wanted
+ * slug (or, for a bare-name reference, the wanted basename) updated after the
+ * origin last resolved it. Their next extraction creates the edge
+ * (src/core/wanted-links.ts).
+ */
+const WANTED_ORIGIN_IS_STALE = sqlFragment`id IN (SELECT w.origin_page_id FROM wanted_links w
+      JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL
+      WHERE t.updated_at > w.checked_at
+    UNION SELECT w.origin_page_id FROM wanted_links w
+      JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL
+      WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)`;
+
+/**
  * Shared stale-for-extraction predicate. `attendance` narrows it by the #5761
  * marker: a page is attendance-blocked while its marker equals its current
  * knowledge revision. Extraction itself never passes it, so it keeps
@@ -657,13 +672,14 @@ export async function resolveSlugs(
  */
 function stalePagesWhere(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }) {
   const version = opts?.versionTs
-    ? sqlFragment`(links_extracted_at IS NULL OR links_extracted_at < ${opts.versionTs}::timestamptz OR updated_at > links_extracted_at)`
-    : sqlFragment`(links_extracted_at IS NULL OR updated_at > links_extracted_at)`;
+    ? sqlFragment`(links_extracted_at IS NULL OR links_extracted_at < ${opts.versionTs}::timestamptz OR updated_at > links_extracted_at OR ${WANTED_ORIGIN_IS_STALE})`
+    : sqlFragment`(links_extracted_at IS NULL OR updated_at > links_extracted_at OR ${WANTED_ORIGIN_IS_STALE})`;
   const source = opts?.sourceId ? sqlFragment` AND source_id = ${opts.sourceId}` : sqlFragment``;
   const attendance = opts?.attendance === 'exclude'
     ? sqlFragment` AND links_attendance_blocked_revision IS DISTINCT FROM knowledge_revision`
     : opts?.attendance === 'blocked' ? sqlFragment` AND links_attendance_blocked_revision = knowledge_revision` : sqlFragment``;
-  return sqlFragment`deleted_at IS NULL AND ${version}${source}${attendance}`;
+  // A quarantined page is hidden from search; it is neither re-extracted nor counted as stale.
+  return sqlFragment`deleted_at IS NULL AND ${trustedSql(quarantineFilterFragment('pages'))} AND ${version}${source}${attendance}`;
 }
 
 export async function countStalePagesForExtraction(exec: ScopedRead, opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }): Promise<number> {
@@ -802,42 +818,35 @@ export async function getPageTimestamps(exec: LegacyUnscopedRead, slugs: string[
  */
 const PAGE_VERSION_COLUMNS = trustedSql('pv.id, pv.page_id, pv.compiled_truth, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
   + 'pv.timeline, pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
+const PAGE_VERSION_METADATA_COLUMNS = trustedSql('pv.id, pv.page_id, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
+  + 'pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
 
-export async function getVersions(
+/**
+ * Newest first (`pv.id` breaks snapshot_at ties). Scope and privacy
+ * predicates sit in WHERE, so `limit` bounds only rows the caller may read;
+ * `includeBody: false` never selects the body columns.
+ */
+export async function getVersions<B extends boolean = true>(
   exec: LegacyUnscopedRead,
   slug: string,
-  opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean },
-): Promise<PageVersion[]> {
+  opts?: GetVersionsOpts<B>,
+): Promise<PageVersionRows<B>> {
     const privacy = opts?.excludePrivate
       ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}`) : sqlFragment``;
-    if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
-        JOIN pages p ON p.id = pv.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
-          ${privacy}
-        ORDER BY pv.snapshot_at DESC
-      `);
-      return rows;
-    }
-    if (opts?.sourceId) {
-      const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
-        JOIN pages p ON p.id = pv.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ${opts.sourceId}
-          ${privacy}
-        ORDER BY pv.snapshot_at DESC
-      `);
-      return rows;
-    }
-    const { rows } = await exec.run<PageVersion>(sqlFragment`
-      SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
+    const scope = opts?.sourceIds && opts.sourceIds.length > 0
+      ? sqlFragment`AND p.source_id = ANY(${opts.sourceIds}::text[])`
+      : opts?.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
+    const columns = opts?.includeBody === false ? PAGE_VERSION_METADATA_COLUMNS : PAGE_VERSION_COLUMNS;
+    const limit = opts?.limit !== undefined ? sqlFragment`LIMIT ${opts.limit}` : sqlFragment``;
+    const { rows } = await exec.run(sqlFragment`
+      SELECT ${columns} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
-      WHERE p.slug = ${slug}
+      WHERE p.slug = ${slug} ${scope}
         ${privacy}
-      ORDER BY pv.snapshot_at DESC
+      ORDER BY pv.snapshot_at DESC, pv.id DESC
+      ${limit}
     `);
-    return rows;
+    return rows as PageVersionRows<B>;
   }
 
 export async function revertToVersion(

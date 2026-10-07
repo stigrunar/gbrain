@@ -1,6 +1,7 @@
+import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
+import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { postprocessManagedSynthesis, withPublishPending } from './synthesize-postprocess.ts';
-import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
+import { deferPublishOrThrow, postprocessManagedSynthesis, withPublishPending } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -880,7 +881,7 @@ async function runPhaseSynthesizeInner(
         config.originalsPrefix,
         config.mode,
         summaryDate,
-        config.attributionRules,
+        config.attributionRules, config.dateGrounding,
       ));
       // One check for the whole chunk set: a transcript never half-submits.
       const callsPerChild = config.mode === 'agentic' ? config.maxTurns : 1;
@@ -1176,7 +1177,7 @@ async function runPhaseSynthesizeInner(
     if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
       const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
       if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance)
-        .catch((e: unknown) => { if (!acceptedPendingReceipt(e)) throw e; publishPending++; });
+        .catch((e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
@@ -1484,6 +1485,8 @@ export interface SynthConfig {
   allowUnpriced: boolean;
   /** dream.synthesize.attribution_rules: add SYNTH_ATTRIBUTION_RULE to the prompt (#5425, opt-in). */
   attributionRules: boolean;
+  /** extraction.date_grounding: label the transcript date as the observation date and resolve relative dates against it. */
+  dateGrounding: boolean;
   cooldownHours: number;
   /**
    * D1: Override the per-chunk token budget (model_context × HEADROOM_RATIO
@@ -1750,6 +1753,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     budgetUsd: parseBudgetUsd(await engine.getConfig('dream.synthesize.budget_usd'), DEFAULT_SYNTH_BUDGET_USD),
     allowUnpriced: await loadAllowUnpriced(engine),
     attributionRules: (await engine.getConfig('dream.synthesize.attribution_rules'))?.trim() === 'true',
+    dateGrounding: await isConsumerDateGroundingOn(engine, 'synthesis'),
     cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
@@ -2778,8 +2782,16 @@ function buildSynthesisPrompt(
   cycleDate: string = utcDate(),
   // #5425: opt-in speaker/withdrawal rule (dream.synthesize.attribution_rules).
   attributionRules = false,
+  // extraction.date_grounding: the transcript's own date is the observation date;
+  // the cycle date is never used to resolve relative references.
+  dateGrounding = false,
 ): string {
   const dateHint = t.inferredDate ?? cycleDate;
+  const dateContextLine = !dateGrounding
+    ? `- Today's date: ${dateHint}`
+    : t.inferredDate
+      ? `- ${observationDateLine({ date: t.inferredDate, source: 'caller' })}\n- ${observationDateRule().split('\n').join('\n  ')}`
+      : `- Observation date: unknown (today is ${cycleDate}; never resolve relative dates against it — keep them as written)`;
   const baseSlugSegment = sanitizeForSlug(t.basename) || `session-${dateHint}`;
   const isChunked = chunkTotal > 1;
   const hashSuffix = isChunked
@@ -2812,7 +2824,7 @@ function buildSynthesisPrompt(
   return `You are synthesizing a conversation transcript into the user's personal knowledge brain.
 
 CONTEXT
-- Today's date: ${dateHint}
+${dateContextLine}
 - Transcript hash suffix (USE THIS in slugs): ${hashSuffix}
 - Source file basename: ${baseSlugSegment}${chunkBanner}${priorContradictionsBlock}${triageMapBlock}${linkManifestBlock}${allowedPathsBlock}
 

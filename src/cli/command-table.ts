@@ -36,6 +36,7 @@
 import type { GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { Effect, Notice } from '../core/agent-output.ts';
+import type { OperationContext } from '../core/ops/contract.ts';
 
 export type CliPhase = 'pre-connect' | 'pre-connect-own-engine' | 'post-connect';
 export type CliThinClientMode = 'none' | 'refuse' | 'route-then-refuse';
@@ -51,6 +52,8 @@ export interface CliDispatchContext {
   cliModuleUrl: string;
   /** Agent contract v1 (A6): CLI notice channel (TTY stderr lines, non-TTY `[AGENT]` block, `--json` `notices`). */
   emitNotice?: (n: Notice) => void;
+  /** The CLI's trusted-local operation context (src/cli.ts makeContext), for a command that submits coordinated writes. */
+  makeContext?: (engine: BrainEngine, params: Record<string, unknown>) => Promise<OperationContext>;
 }
 
 /** One curated flag in a lazy help module (D3). */
@@ -365,6 +368,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'loops', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/loops.ts') },
   // CLI_ONLY: relationship-contradiction proposals (temporal typed edges); host-local, writes canonical timeline lines.
   { name: 'edge-proposals', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/edge-proposals.ts') },
+  // selfHelp: core prints its own usage (commands/core.ts). Always-loaded core memory, docs/guides/core-memory.md.
+  { name: 'core', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/core.ts') },
   // selfHelp: connectors ships its own printHelp (commands/connectors/index.ts) with the
   // per-subcommand usage; keep the generic short-circuit from hiding it.
   { name: 'connectors', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/connectors.ts') },

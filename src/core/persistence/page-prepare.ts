@@ -16,7 +16,7 @@ import { contentRefusalError } from '../import-screen.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
 import { assertPageRevision, type PageSnapshot } from '../page-state/types.ts';
 import { gitHoldFix, readGitHold } from './sync-holds.ts';
-import { hostOperatorFix } from './held-reads.ts';
+import { hostOperatorFix, recordRoute } from './held-reads.ts';
 import { heldFileMessage } from './verb-errors.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
@@ -45,6 +45,11 @@ import { DERIVE_PHASE_DB_ONLY_DEFAULTS } from '../storage-config.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
 import { readSlugRootMode } from '../sync-anchor.ts';
 import { applyPageEdits, editDiff, parsePageEdits } from './page-edit.ts';
+import { carryCoreMarking, prepareCoreGuard } from './core-guard.ts';
+import { fenceWhere } from '../fence-repair/refusal.ts';
+import { pageFencesNormalized } from '../fence-repair/report.ts';
+import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
+import { fenceRepairCommit } from './effect-model.ts';
 
 const PURGE_RESIDUALS = 'Brain-repo git history, synced working-tree copies, exports, compiled context files and slug-keyed derived rows (takes, open loops, file records) may still hold the content — rotate the credential and rewrite or regenerate those copies.';
 
@@ -130,7 +135,7 @@ export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, byt
   return digest(actual) === digest(canonical(snapshot.page, snapshot.tags));
 }
 export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, snapshot: PageSnapshot | null,
-  content: string | null, hostId?: string, options: { allowMissing?: boolean; capture?: { path: string; hash: string }; activePack?: ParseOpts['activePack']; remote?: boolean } = {}): Promise<PreparedMutation['file']> {
+  content: string | null, hostId?: string, options: { allowMissing?: boolean; deleting?: boolean; capture?: { path: string; hash: string }; activePack?: ParseOpts['activePack']; remote?: boolean } = {}): Promise<PreparedMutation['file']> {
   if (!row.worktree_id) return undefined;
   // #5409: a read-only mirror's checkout belongs to its Git remote; nothing is written or removed there.
   if (await sourceMirrorReadOnly(engine, row.source_id)) return undefined;
@@ -167,6 +172,7 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
     // canonical file publishes to the database only; a recorded file that went
     // missing still refuses below.
     if (publishesDatabaseOnly(root, row.slug, snapshot)) return undefined;
+    if (options.deleting === true && content === null && !snapshot.page.source_path && !capturedPath) return undefined;
     throw new OperationError('source_changed', 'The canonical file was removed outside coordinated publication.',
       'Import the local deletion or recover the canonical file before editing this page.');
   }
@@ -205,7 +211,7 @@ async function heldFileRefusal(engine: BrainEngine, row: Pick<WriteRequest, 'sou
     const error = opError('source_changed', heldFileMessage(kind, hold.code),
       `Sync holds this page's canonical file in source ${row.source_id} (${hold.code}${hold.meta.reason ? `, ${hold.meta.reason}` : ''}) because gbrain cannot import it, `
       + `so ${effect} is read-only for put_page until the brain host operator repairs the file; retrying this write refuses the same way. Relay the fix to the user, then submit the intended write with a new request_id. Neither copy was overwritten.`,
-      { fix: hostOperatorFix([row.source_id], `The canonical file of page ${row.slug} is held (${hold.code}): only the brain host operator can inspect and repair it.`) });
+      { fix: hostOperatorFix([{ source_id: row.source_id, route: recordRoute(hold) }], `The canonical file of page ${row.slug} is held (${hold.code}): only the brain host operator can inspect and repair it.`) });
     if (kind === 'drift') error.detail = 'file_database_drift';
     return error;
   }
@@ -266,10 +272,12 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
       `Page ${row.slug} does not exist in source ${row.source_id}, so nothing was deleted. Check the slug and the source.`, pageFix(row.source_id, row.slug));
     const purge = p.purge === true;
     const noop = !purge && snapshot.page.deleted_at != null;
+    // Always-loaded core pages: a remote caller cannot delete one (owner-only).
+    if (!noop) await prepareCoreGuard(engine, { row, snapshot, incoming: null });
     // Tombstones still own their recorded artifact. Purge always attempts its
     // removal before the guarded hard-delete and receipt commit; failure rolls
     // back to the prior row, and replay survives the eventual absence of that row.
-    const file = await prepareFileTarget(engine, row, snapshot, null, undefined, { allowMissing: purge || options.allowMissingFile, activePack, remote: row.authority.remote });
+    const file = await prepareFileTarget(engine, row, snapshot, null, undefined, { allowMissing: purge || options.allowMissingFile, deleting: true, activePack, remote: row.authority.remote });
     return { observedRevision, noop, file, ...await pageDatabaseOnlyPublication(engine, row, file), apply: async tx => {
       if (purge) {
         await tx.deletePage(row.slug, source);
@@ -280,6 +288,9 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
         recoverable_until: 'now + 72h via restore_page (remove immediately instead: gbrain delete <slug> --purge, local CLI only)' };
     } };
   }
+  // #6188: a trusted local fence repair's receipt (admission refuses it from every other caller) rides the outcome and the file's commit.
+  const fenceRepair = row.operation === 'put_page' && !row.authority.remote ? parseFenceRepairReceipt(p.fence_repair) : null;
+  const fenceRepairOutcome = fenceRepair ? { fence_repair: fenceRepair } : {};
   // #5616: edits apply to the caller's view of the locked snapshot (revision checked above).
   const edited = row.operation === 'edit_page' ? editLockedPage(row, snapshot) : undefined;
   let content = edited?.content ?? preparedIntent?.content ?? p.content as string;
@@ -315,6 +326,16 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     if (compiled_truth!==parsed.compiled_truth || timeline!==(parsed.timeline??'')) content=serializePageToMarkdown({
       ...(snapshot?.page??{id:0,source_id:row.source_id,created_at:new Date(),updated_at:new Date()}),...parsed,compiled_truth,timeline},parsed.tags);
   }
+  // Core marking is owner-only: a remote write that omits always_load or
+  // core_priority keeps the stored values instead of silently un-coring the page.
+  if (row.authority.remote && snapshot && !snapshot.page.deleted_at && typeof content === 'string'
+    && (snapshot.page.frontmatter?.always_load !== undefined || snapshot.page.frontmatter?.core_priority !== undefined)) {
+    const parsed = parseMarkdown(content, row.slug, { activePack });
+    const carried = carryCoreMarking(snapshot.page.frontmatter, parsed.frontmatter ?? {});
+    if (carried.always_load !== parsed.frontmatter?.always_load || carried.core_priority !== parsed.frontmatter?.core_priority) {
+      content = serializePageToMarkdown({ ...snapshot.page, ...parsed, frontmatter: carried }, parsed.tags);
+    }
+  }
   const projected = !(row.operation === 'remember' || row.operation.startsWith('takes_') || (row.operation === 'extract_facts' && p.kind === 'managed_facts_entity'));
   const writer = (row.operation === 'put_page' || row.operation === 'edit_page') && p.kind !== 'managed_maintenance_page'
     && (preparedIntent !== undefined || typeof p.expected_revision === 'string') ? 'editing' : 'preserving';
@@ -335,13 +356,13 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
       const file=await prepareFileTarget(engine,row,snapshot,targetDeleted ? null : serializePageToMarkdown(snapshot.page,snapshot.tags),undefined,{ activePack, remote: row.authority.remote });
       return {observedRevision,noop:true,file,...await pageDatabaseOnlyPublication(engine,row,file),
         apply:async()=>({...pageNoopAdvisories(row),status:'skipped',slug:row.slug,source_id:row.source_id,noop:true,chunks:0,chunk_skip_reason:'write_skipped',
-          ...(row.operation==='capture'?{channel:'capture',content_hash:p.capture_hash}:{})})};
+          ...(row.operation==='capture'?{channel:'capture',content_hash:p.capture_hash}:{}),...fenceRepairOutcome})};
     }
   }
   let prepared: PreparedContentImport | undefined;
   let provenance: CanonicalProvenance | undefined;
   const result = await importFromContent(engine, row.slug, content, {
-    ...source, noEmbed: true, remote: row.authority.remote, activePack,
+    ...source, noEmbed: true, remote: row.authority.remote, activePack, fences: projected ? 'coordinated' : 'lenient',
     forceRechunk: row.operation === 'restore_page' || row.operation === 'revert_version',
     allowEmptyOverwrite: p.allow_empty === true || row.operation === 'restore_page' || row.operation === 'revert_version',
     source_kind: typeof p.source_kind === 'string' ? p.source_kind : null,
@@ -360,6 +381,8 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     const refusal = result.refusal && row.authority.remote && result.refusal.code === 'invalid_frontmatter'
       ? { ...result.refusal, key: undefined, message: frontmatterHoldMessageWithoutKeys(result.refusal.message) } : result.refusal;
     if (refusal?.code === 'file_too_large') throw contentRefusalError(refusal, 'Split the content into smaller pages, then submit each with its own request_id.', { legacy_error: 'request_too_large' });
+    if (refusal?.code === 'invalid_fence') throw contentRefusalError(refusal, `Page ${row.slug} was not written. Fix ${fenceWhere(refusal.fence)} as the message says (fence_issues lists every row and column; use the allowed values), `
+      + 'or write facts with remember and takes with takes_add instead of a hand-built table, then submit the corrected content with a new request_id.', { legacy_error: 'invalid_params' });
     if (refusal) throw contentRefusalError(refusal, `Correct ${refusal.line !== undefined ? `frontmatter line ${refusal.line}${refusal.key ? ` (key "${refusal.key}")` : ''}` : 'the frontmatter'}: one line per key with its whole value quoted, then submit the corrected content with a new request_id.`,
       { legacy_error: 'invalid_params' });
     throw opError('invalid_params', 'The content was rejected before publication.', 'Check the content and frontmatter, then submit the corrected content with a new request_id.');
@@ -389,7 +412,7 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
   const noop = logicalNoop && (snapshot?.page.deleted_at != null) === targetDeleted;
   const project = projected ? await prepareCanonicalProjections(engine,ready.parsedPage,row.slug,row.source_id,snapshot,writer) : undefined;
   const ordinaryPage = ['put_page','capture','restore_page','revert_version','edit_page'].includes(row.operation);
-  const advisories = noop || targetDeleted ? pageNoopAdvisories(row) : !ordinaryPage ? remoteLinkHint(row) : await preparePageAdvisories(engine,row,ready.parsedPage);
+  const advisories = noop || targetDeleted ? pageNoopAdvisories(row) : !ordinaryPage ? remoteLinkHint(row) : await preparePageAdvisories(engine,row,ready.parsedPage,snapshot);
   // A managed maintenance page (e.g. the dream write-back after grounding
   // quarantine) republishes a body; its automatic links follow that body.
   const autoLinkedPage = ordinaryPage || p.kind === 'managed_maintenance_page';
@@ -397,12 +420,21 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     ? await prepareAutomaticLinks(engine,row.slug,ready.parsedPage,row.source_id) : undefined;
   const capture = row.operation === 'capture' && typeof p.capture_path === 'string' && typeof p.capture_file_hash === 'string'
     ? { path: p.capture_path, hash: p.capture_file_hash } : undefined;
-  const file = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile, activePack, remote: row.authority.remote });
+  // #6188 (D12): what Tier 1 rewrote; a remote caller is never told about the takes fence it cannot read (preserved verbatim).
+  const shownFixes = (ready.result.fences_normalized ?? []).filter(fix => !row.authority.remote || fix.fence !== 'takes');
+  const fencesNormalized = shownFixes.length ? { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: shownFixes,
+    writer: row.principal_kind, path: snapshot?.page.source_path ?? null, remote: row.authority.remote }) } : {};
+  const target = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile, activePack, remote: row.authority.remote });
+  const file = target && fenceRepair ? { ...target, commit: fenceRepairCommit(relative(target.root, target.path).split(sep).join('/'), fenceRepair.classes) } : target;
   const mintMode = file && !snapshot?.page.source_path ? await scannerSlugRootMode(engine, row.source_id, file.root) : undefined;
   const sourcePath = file && mintMode ? scannerSourcePath(file.root, file.path, mintMode) : undefined;
   // An inferred mode is pinned with the first origin it mints, so later pages cannot flip the inference (#5610).
   const pinMode = sourcePath && mintMode && scannerSourcePath(file!.root, file!.root) && !await readSlugRootMode(engine, row.source_id) ? mintMode : undefined;
-  return { observedRevision, noop, additionalPageKeys:links?.pageKeys, file, ...await pageDatabaseOnlyPublication(engine, row, file), validate: ready.validate, apply: async tx => {
+  // Always-loaded core tier: owner-only marking, brain-wide budget, remote-edit policy (core-guard.ts).
+  const core = noop ? null : await prepareCoreGuard(engine, { row, snapshot, incoming: targetDeleted ? null : ready.parsedPage });
+  return { observedRevision, noop, additionalPageKeys:links?.pageKeys, file, ...await pageDatabaseOnlyPublication(engine, row, file),
+    ...(core ? { exclusiveSources: core.exclusiveSources } : {}),
+    validate: async tx => { await ready.validate(tx); await core?.validate(tx); }, apply: async tx => {
     let autoLinks: Awaited<ReturnType<NonNullable<typeof links>['apply']>> | undefined;
     if (!noop) {
       const applied = await ready.apply(tx);
@@ -430,14 +462,16 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
       // Index installation and terminal receipt share this transaction. The import sealed the projection
       // as its last revision-changing step; only a later revision change (restore, tags, links, delete) reseals.
       if (!(applied?.sealed && row.operation !== 'restore_page' && !versionTags && !links && !targetDeleted)) await sealPageTextProjection(tx, row.slug, row.source_id);
+      if (core) await core.record(tx, (await tx.readPageSnapshot(row.slug, source))?.revision ?? null);
     }
-    return { ...advisories, ...(autoLinks ? {auto_links:autoLinks} : {}),
+    const coreUsage = core?.usage();
+    return { ...advisories, ...(autoLinks ? {auto_links:autoLinks} : {}), ...(coreUsage ? { core: coreUsage } : {}),
       status: noop ? 'skipped' : row.operation === 'restore_page' ? 'restored' : row.operation === 'revert_version' ? 'reverted' : 'created_or_updated',
       slug: row.slug, source_id: row.source_id, chunks: ready.result.chunks, noop,
       ...(ready.result.chunks === 0 ? {chunk_skip_reason: noop ? 'write_skipped'
         : isEmbedSkipped(ready.parsedPage.frontmatter) || isQuarantined(ready.parsedPage.frontmatter) ? 'embed_skip' : 'empty_body'} : {}),
       ...(row.operation === 'capture' ? { channel: 'capture', content_hash: p.capture_hash } : {}),
-      ...(edited ? editDiff(row.slug, edited.before, edited.after) : {}) };
+      ...(edited ? editDiff(row.slug, edited.before, edited.after) : {}), ...fencesNormalized, ...fenceRepairOutcome };
   } };
 }
 

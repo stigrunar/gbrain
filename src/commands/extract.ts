@@ -47,6 +47,8 @@ import { isUndefinedTableError } from '../core/utils.ts';
 import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { resolveCandidateSources, resolveLinkFallbackDefault, loadLinkPageMetadata, capturedLinkEndpoints, fileLinkOwnership, replaceFileLinks, replacePageFileLinks, type LinkPageMetadata } from '../core/link-reconciliation.ts';
+import { collectWantedLinks, isWantedPagesEnabled } from '../core/wanted-links.ts';
+import { lineGrammarOptions, statedRelationTypes } from '../core/line-grammar.ts';
 export { reconcileSourceLinks, type SourceLinkReconciliationResult } from '../core/link-reconciliation.ts';
 export { extractMarkdownLinks } from '../core/link-extraction.ts';
 import {
@@ -86,6 +88,7 @@ import { formatMentionSummary, linkPhaseDeadline, mentionJsonFields, previewMent
 import {
   loadOpCheckpoint, recordCompleted, clearOpCheckpoint, mentionsFingerprint,
 } from '../core/op-checkpoint.ts';
+import { isQuarantined, quarantinedSlugs } from '../core/quarantine.ts';
 // v0.41.15.0 (T7, D9): --workers N for the fs-walk inner loops via the
 // shared sliding-pool helper + PGLite-clamp wrapper.
 import { runSlidingPool } from '../core/worker-pool.ts';
@@ -495,7 +498,8 @@ async function loadSlugAliasTargets(engine: BrainEngine, sourceId: string, allSl
 export async function extractLinksFromFile(
   content: string, relPath: string, allSlugs: Set<string>,
   opts?: { includeFrontmatter?: boolean; globalBasename?: boolean; pack?: LinkExtractionPack | null;
-    pageTypes?: ReadonlyMap<string, string>; aliases?: ReadonlyMap<string, string> },
+    pageTypes?: ReadonlyMap<string, string>; aliases?: ReadonlyMap<string, string>;
+    lineGrammar?: { enabled?: boolean; allowUndeclaredTypes?: boolean } },
 ): Promise<ExtractedLink[]> {
   const links: ExtractedLink[] = [];
   // Renamed pages: `allSlugs` also holds their old slugs (see
@@ -520,6 +524,7 @@ export async function extractLinksFromFile(
   // DB path, which goes through extractEntityRefs (which strips internally).
   const scanContent = stripCodeBlocks(content);
   const attendanceRanges = attendanceEvidenceRanges(content);
+  const statedType = statedRelationTypes(content, { ...opts?.lineGrammar, declaredVerbs: pack?.link_types.map(lt => lt.name) });
 
   for (const { name, relTarget, index } of extractMarkdownLinks(scanContent, true)) {
     const resolvedSlugs = resolveSlugAll(fileDir, relTarget, allSlugs, { globalBasename });
@@ -543,7 +548,9 @@ export async function extractLinksFromFile(
       const targetType = opts?.pageTypes?.get(target) ?? parseMarkdown('', `${target}.md`, { activePack }).type;
       const position = index ?? scanContent.indexOf(name);
       const evidence = scanContent.slice(Math.max(0, position - 120), position + 240);
-      let inferred = pack ? inferLinkTypeFromPack(pack, guessedPageType, evidence, packBudget, targetType) : null;
+      const stated = statedType(position);
+      let inferred = stated && !(stated === 'attended' && guessedPageType === 'meeting') ? stated
+        : pack ? inferLinkTypeFromPack(pack, guessedPageType, evidence, packBudget, targetType) : null;
       if (inferred === 'attended' && guessedPageType === 'meeting' && !packOwnsAttendance) inferred = null;
       const bareTarget = relTarget.endsWith('.md') ? relTarget.slice(0, -3) : relTarget;
       const ambiguousAttendance = !inferred && guessedPageType === 'meeting' && targetType === 'person'
@@ -1308,6 +1315,7 @@ async function extractForSlugs(
   // every non-slug filename as a deleted file and skip it without a word.
   const slugToPath = buildSlugPathIndex(allFiles);
   const allSlugs = new Set(slugToPath.keys());
+  const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
   const doLinks = mode === 'links' || mode === 'all';
   const doTimeline = mode === 'timeline' || mode === 'all';
@@ -1392,6 +1400,7 @@ async function extractForSlugs(
       // #1972: bail before doing any work for this slug on abort. The trailing
       // flushTimeline still commits accumulated rows — no torn write.
       if (isAborted(signal)) return;
+      if (quarantined.has(slug)) return;
       const relPath = resolveSlugRelPath(slugToPath, brainDir, slug);
       if (relPath === undefined) return; // deleted file — sync already handled removal
       const fullPath = join(brainDir, relPath);
@@ -1472,6 +1481,7 @@ async function extractLinksFromDir(
   const stdoutQuiet = jsonMode || quiet;
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
+  const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
   // Issue #972: read once before the walk so the per-file calls don't
   // re-query the DB. globalBasename = true emits one edge per basename
@@ -1503,6 +1513,7 @@ async function extractLinksFromDir(
     onItem: async (file) => {
       // #1972: bail before this file on abort; each page's links are replaced in its own transaction.
       if (isAborted(signal)) return;
+      if (quarantined.has(pathToSlug(file.relPath))) return;
       try {
         const slug = pathToSlug(file.relPath);
         const snapshot = ownership && (ownership.metadata.get(`${sourceId ?? 'default'}\0${slug}`)?.type === 'meeting' || ownership.origins.has(slug))
@@ -1554,6 +1565,7 @@ async function extractTimelineFromDir(
 ): Promise<{ created: number; pages: number }> {
   const stdoutQuiet = jsonMode || quiet;
   const files = walkMarkdownFiles(brainDir);
+  const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('extract.timeline_fs', files.length);
@@ -1587,6 +1599,7 @@ async function extractTimelineFromDir(
     onItem: async (file) => {
       // #1972: bail before this file on abort; trailing flush() commits the batch.
       if (isAborted(signal)) return;
+      if (quarantined.has(pathToSlug(file.relPath))) return;
       try {
         const content = readFileSync(file.path, 'utf-8');
         const slug = pathToSlug(file.relPath);
@@ -1679,6 +1692,7 @@ export async function extractLinksForSlugs(
   // frontmatter knob without per-caller threading — an unattended sync used to
   // skip `related:` edges and then stamp the page fresh, defeating the knob.
   const includeFrontmatter = opts?.includeFrontmatter ?? await resolveIncludeFrontmatter(engine);
+  const quarantined = await quarantinedSlugs(engine, sourceId);
   let created = 0;
   // Only a slug whose file was found AND read counts as processed. The
   // caller stamps the watermark for these and no others, so a silent skip
@@ -1687,7 +1701,7 @@ export async function extractLinksForSlugs(
   const errors: Array<{ slug: string; error: string }> = [];
   const reads: Array<{ slug: string; relPath: string; content: string; links: LinkBatchInput[] }> = [];
   for (const slug of slugs) {
-    const relPath = resolveSlugRelPath(slugToPath, repoPath, slug);
+    const relPath = quarantined.has(slug) ? undefined : resolveSlugRelPath(slugToPath, repoPath, slug);
     if (relPath === undefined) continue;
     try {
       // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- relPath comes from the slug→path index built by walkMarkdownFiles(repoPath) (repo-relative entries of that walk) or the validated-slug legacy fallback, never from a caller
@@ -1731,11 +1745,12 @@ export async function extractTimelineForSlugs(
   // across every source containing the slug (the addTimelineEntry's
   // INSERT...SELECT-from-pages fan-out was Data R1's HIGH 2).
   const entryOpts = opts?.sourceId ? { sourceId: opts.sourceId } : undefined;
+  const quarantined = await quarantinedSlugs(engine, opts?.sourceId ?? 'default');
   let created = 0;
   const processed: string[] = [];
   const errors: Array<{ slug: string; error: string }> = [];
   for (const slug of slugs) {
-    const relPath = resolveSlugRelPath(slugToPath, repoPath, slug);
+    const relPath = quarantined.has(slug) ? undefined : resolveSlugRelPath(slugToPath, repoPath, slug);
     if (relPath === undefined) continue;
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- relPath comes from the walkMarkdownFiles(repoPath) index or the validated-slug legacy fallback, never from a caller
     const filePath = join(repoPath, relPath);
@@ -1873,7 +1888,7 @@ async function extractLinksFromDB(
 
   for (const { slug, source_id } of walkRefs) {
     const snapshot = await engine.readPageSnapshot(slug, { sourceId: source_id });
-    if (!snapshot) continue;
+    if (!snapshot || isQuarantined(snapshot.page.frontmatter)) continue;
     const page = snapshot.page;
     if (typeFilter && page.type !== typeFilter) continue;
     await loadSourceLinkPacks(engine, [source_id], packs);
@@ -1891,7 +1906,7 @@ async function extractLinksFromDB(
     // basename lookup; off by default for back-compat.
     const extracted = await extractPageLinks(
       slug, fullContent, page.frontmatter, page.type, resolver,
-      { skipFrontmatter: !includeFrontmatter, globalBasename, pack, targetType: (targetSlug, targetSourceId) => {
+      { skipFrontmatter: !includeFrontmatter, globalBasename, pack, lineGrammar: await lineGrammarOptions(engine), targetType: (targetSlug, targetSourceId) => {
         const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, slug,
           source_id, allSlugs, slugToSources, federatedSourceIds.has(source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
         return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
@@ -1939,8 +1954,13 @@ async function extractLinksFromDB(
     }
     if (!dryRun) {
       try {
+        const wanted = await isWantedPagesEnabled(engine) ? collectWantedLinks({ candidates: extracted.candidates,
+          frontmatterUnresolved: includeFrontmatter ? extracted.unresolved : [], originSourceId: source_id,
+          crossSourceAllowed: federatedSourceIds.has(source_id) || crossSource, resolve: c => resolveCandidateSources(c, slug, source_id,
+            allSlugs, slugToSources, federatedSourceIds.has(source_id), { crossSource, defaultSourceId: linkDefaultSourceId }) }) : [];
         const written = await engine.replaceDerivedLinks({ slug, sourceId: source_id, expectedRevision: snapshot.revision,
           sourceIncarnation: snapshot.sourceIncarnation }, batch, { includeFrontmatter,
+          wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] : ['body'], rows: wanted },
           expectedEndpoints: capturedLinkEndpoints(batch, targetMetadata) });
         created += written.created;
       } catch (error) {
@@ -2119,6 +2139,7 @@ export async function extractStaleFromDB(
   // from a genuinely missing target.
   let skippedCrossSource = 0;
 
+  const wantedEnabled = await isWantedPagesEnabled(engine);
   for (;;) {
     const rows = await engine.listStalePagesForExtraction({
       batchSize: STALE_BATCH_SIZE, afterPageId, sourceId: sourceIdFilter, versionTs,
@@ -2145,7 +2166,7 @@ export async function extractStaleFromDB(
       const resolver = resolvers.get(page.source_id)!;
       const extracted = await extractPageLinks(
         page.slug, fullContent, snapshot.page.frontmatter, snapshot.page.type, resolver,
-        { skipFrontmatter: !includeFrontmatter, globalBasename, pack, targetType: (targetSlug, targetSourceId) => {
+        { skipFrontmatter: !includeFrontmatter, globalBasename, pack, lineGrammar: await lineGrammarOptions(engine), targetType: (targetSlug, targetSourceId) => {
           const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, page.slug,
             page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
           return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
@@ -2170,7 +2191,12 @@ export async function extractStaleFromDB(
         linkRows.push(resolvedLinkCandidate(c, page.slug, page.source_id, r));
       }
       const origin = { slug: page.slug, sourceId: page.source_id, expectedRevision: snapshot.revision, sourceIncarnation: snapshot.sourceIncarnation };
-      const linkOpts = { includeFrontmatter, expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata) };
+      const wanted = wantedEnabled ? collectWantedLinks({ candidates: extracted.candidates,
+        frontmatterUnresolved: includeFrontmatter ? extracted.unresolved : [], originSourceId: page.source_id,
+        crossSourceAllowed: federatedSourceIds.has(page.source_id) || crossSource, resolve: c => resolveCandidateSources(c, page.slug,
+          page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId }) }) : [];
+      const linkOpts = { includeFrontmatter, expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata),
+        wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] as const : ['body'] as const, rows: wanted } };
       const stampIso = page.updated_at.getTime() >= Date.parse(versionTs) ? page.updated_at_iso : versionTs;
       const written = await engine.replaceDerivedLinks(origin, linkRows, linkOpts);
       linksCreated += written.created;
@@ -2400,7 +2426,7 @@ async function extractMentionsFromDb(
     // itself a completed decision. (#4304: the --since filter moved to the
     // ref level above — out-of-window pages never reach this loop.)
     const key = `${source_id}::${slug}`;
-    if (!page || (typeFilter && page.type !== typeFilter)) {
+    if (!page || isQuarantined(page.frontmatter) || (typeFilter && page.type !== typeFilter)) {
       pendingForFlush.push(key);
       unpersistedCount++;
       continue;
