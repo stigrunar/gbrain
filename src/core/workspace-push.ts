@@ -1,4 +1,5 @@
-import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
+import { assertManagedFilesystemWrite, isManagedFilesystemPath, managedFilesystemRootFor } from './persistence/filesystem-guard.ts';
+import { OWNERSHIP_MARKER_GLOBS } from './persistence/root-metadata.ts';
 import { OperationError } from './ops/contract.ts';
 /**
  * workspace-push.ts — the `gbrain sources push` core: scan-gated
@@ -57,8 +58,8 @@ import {
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { createHash, randomBytes } from 'crypto';
-import { execFileSync } from 'child_process';
-import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, detectDefaultBranch, divergenceSafePull } from './git-remote.ts';
+import { execFileSync } from './spawn.ts';
+import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, detectDefaultBranch, divergenceSafePull, type PullStrategy } from './git-remote.ts';
 import { loadConfigFileOnly } from './config.ts';
 import { ensureGbrainHome } from './gbrain-home.ts';
 import { invalidateBackupStatus, loadBackupStatus } from './backup/status-file.ts';
@@ -75,6 +76,7 @@ import {
   type SecretFinding,
 } from './secret-scan.ts';
 import { shellQuote } from './mcp-registration.ts';
+import { gitChildEnv } from './git-env.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -148,6 +150,8 @@ export interface WorkspacePushOpts {
   dir: string;
   /** Branch to pull/push; default `detectDefaultBranch(root)`. */
   branch?: string;
+  /** How the pre-push pull reconciles divergence (`sources.config.pull_strategy`, #5429); default rebase. */
+  pullStrategy?: PullStrategy;
   /** Escape hatch for self-hosted git: skip the gh privacy verification [G8]. Logged. */
   allowUnverifiedRemote?: boolean;
   commitMessage?: string;
@@ -159,9 +163,13 @@ export interface WorkspacePushOpts {
   holdLockMs?: number;
 }
 
-/** Deny-glob backstop list [G6]. Matched with secret-scan's glob dialect. */
+/**
+ * Deny-glob backstop list [G6]. Matched with secret-scan's glob dialect.
+ * #5186: ownership markers (`OWNERSHIP_MARKER_GLOBS`) and the bootstrap lock
+ * are denied like credentials; the ownership token never reaches a remote.
+ */
 export const PUSH_DENY_GLOBS: readonly string[] = [
-  '*.pglite', '.env*', '*.pem', '*.key', '.gbrain/**',
+  '*.pglite', '.env*', '*.pem', '*.key', '.gbrain/**', ...OWNERSHIP_MARKER_GLOBS, '.gbrain-bootstrap.lock/**',
 ];
 
 /** Files larger than this are neither scanned nor considered text candidates. */
@@ -292,7 +300,7 @@ function git(
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: opts.timeoutMs ?? 60_000,
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, ...(opts.auth ? GIT_ENV_AUTH : GIT_ENV) },
+    env: gitChildEnv({ ...(opts.auth ? GIT_ENV_AUTH : GIT_ENV) }),
   }).toString();
 }
 
@@ -310,7 +318,7 @@ function gitBuffer(root: string, args: string[], timeoutMs = 60_000): Buffer {
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitChildEnv({ ...GIT_ENV }),
   });
 }
 
@@ -426,6 +434,8 @@ export interface PushStatusEntry {
   reason?: string;
   ahead?: number;
   repoRoot?: string;
+  /** #6083: machine code of a refusal (`writer_coordinator_required` on a managed worktree). */
+  code?: string;
   /** Absolute path of the status file (per-root announce-state keying). */
   file: string;
 }
@@ -625,6 +635,32 @@ export function formatBlockedSecrets(findings: readonly PushSecretFinding[]): st
   return lines;
 }
 
+/**
+ * #5799: a recorded push status that no longer describes a live legacy push.
+ * On a managed canonical worktree the legacy push is fenced
+ * (`writer_coordinator_required`) and the coordinator's git effect publishes
+ * page writes without ever writing push-status, so the refusal record (or a
+ * success from before the worktree was claimed) would feed the FAILING
+ * banner and the staleness note forever. True for a refusal record (its
+ * `code`, or the `reason` prefix an older record carries) and for any record
+ * whose root is a managed worktree now. A root whose marker cannot be read
+ * is not assumed managed.
+ */
+export function isSupersededPushStatus(entry: Pick<PushStatusEntry, 'code' | 'reason' | 'repoRoot'>): boolean {
+  if (entry.code === 'writer_coordinator_required' || entry.reason?.startsWith('writer_coordinator_required:')) return true;
+  if (entry.repoRoot === undefined) return false;
+  try {
+    return isManagedFilesystemPath(entry.repoRoot);
+  } catch {
+    return false;
+  }
+}
+
+/** The recorded statuses that still describe a live legacy push (#5799); the status surfaces read these. */
+export function livePushStatuses(entries: readonly PushStatusEntry[]): PushStatusEntry[] {
+  return entries.filter((e) => !isSupersededPushStatus(e));
+}
+
 export function summarizePushStatuses(entries: PushStatusEntry[]): {
   failing: PushStatusEntry[];
   stalestTs: number | null;
@@ -635,7 +671,7 @@ export function summarizePushStatuses(entries: PushStatusEntry[]): {
 }
 
 function writePushStatus(
-  status: { ts: string; ok: boolean; reason?: string; ahead?: number; repoRoot: string },
+  status: { ts: string; ok: boolean; reason?: string; ahead?: number; repoRoot: string; code?: string },
 ): void {
   try {
     const p = pushStatusPathForRoot(status.repoRoot);
@@ -663,6 +699,27 @@ export function aheadCount(root: string, branch: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/**
+ * #5606: `sources push` on a managed canonical worktree is refused with the
+ * managed equivalent named, not a bare "submit through the coordinator": the
+ * persistence owner's Git effect is the writer for page files, the writer
+ * verbs check and enable it, and files that are not pages are the operator's
+ * to push with plain git. Same code, so every surface that keys on it still does.
+ */
+export function managedPushRefusal(dir: string, root: string | null | undefined, cause: OperationError): OperationError {
+  const managed = managedFilesystemRootFor(root ?? dir) ?? managedFilesystemRootFor(dir);
+  const source = managed?.sourceId;
+  const name = source ?? '<source>';
+  const error = new OperationError('writer_coordinator_required',
+    `${managed?.root ?? root ?? dir} is the managed canonical worktree${source ? ` of source ${source}` : ''}; gbrain sources push is not its Git writer.`,
+    `Page writes there are committed and pushed by the persistence owner's Git effect, not by sources push. Check it with gbrain sources writer status${source ? ` ${source}` : ''} --json `
+    + `(git_durability, parked effects). If git_durability is off or unknown, enable it with gbrain sources writer git-durability ${name} --enable --dry-run, then the apply command it prints; `
+    + `after a push credential change, gbrain sources writer git-durability ${name} --pat-file <path> re-wires it and retries the parked pushes. `
+    + 'Files that are not gbrain pages (MEMORY.md, daily notes) are not published by the owner: review the diff and push them with plain git; the sources push secret scan does not run then.');
+  error.detail = cause.detail;
+  return error;
+}
+
 export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspacePushResult> {
   const log = (line: string) => opts.logger?.(line);
 
@@ -676,10 +733,11 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // status surface calls a push that can never run "stale" instead of failing.
     // No lock winner can be in flight here: the same guard refuses every legacy
     // push of this root.
-    if (root && e instanceof OperationError) {
-      writePushStatus({ ts: new Date().toISOString(), ok: false, reason: `${e.code}: ${e.message}`, repoRoot: root });
+    const refusal = e instanceof OperationError && e.code === 'writer_coordinator_required' ? managedPushRefusal(opts.dir, root, e) : e;
+    if (root && refusal instanceof OperationError) {
+      writePushStatus({ ts: new Date().toISOString(), ok: false, code: refusal.code, reason: `${refusal.code}: ${refusal.message}`, repoRoot: root });
     }
-    throw e;
+    throw refusal;
   }
   if (!root) {
     return { ok: false, status: 'error', reason: `not a git repository: ${opts.dir}` };
@@ -935,7 +993,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // 6. pull AFTER commit [CX2-7] — a dirty tree is impossible here short of
     // a mid-run writer, and divergenceSafePull handles that as skipped_dirty.
     try {
-      const pull = divergenceSafePull(root, branch);
+      const pull = divergenceSafePull(root, branch, { strategy: opts.pullStrategy });
       if (pull.status === 'conflict_aborted') {
         return finish({
           ok: false, status: 'pull_conflict', repoRoot: root, branch, committed,

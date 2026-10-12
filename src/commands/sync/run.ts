@@ -19,8 +19,7 @@ import {
 } from '../../core/sync-embed-backfill.ts';
 import type { SyncEmbedBackfillOutcome } from '../../core/sync-embed-backfill.ts';
 import { runBreakLock } from '../../core/sync-lock.ts';
-import { isSyncDisabledConfig } from '../../core/sync-policy.ts';
-import { syncContentDirectory } from '../../core/sync-applicability.ts';
+import { automaticSyncSkip, isSyncDisabledConfig } from '../../core/sync-policy.ts';
 import { composeAbortSignals } from '../../core/sync-reconcile.ts';
 import { acknowledgeFailures, unacknowledgedSyncFailures } from '../../core/sync.ts';
 import type { SyncResult, SyncOpts } from '../sync.ts';
@@ -38,6 +37,7 @@ import {
 } from './report.ts';
 import { runSyncTrigger } from './trigger.ts';
 import { drainJsonFields, formatDrainSummary, syncOutcome } from '../../core/persistence/sync-drain.ts';
+import { readManagedMode } from '../../core/persistence/ownership.ts';
 import { writeJsonDocument } from '../../core/cli-force-exit.ts';
 
 /** D2: under the `--json` guard only writeStdoutFinal reaches fd 1 (writeJsonDocument). */
@@ -63,6 +63,11 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   if (args[0] === 'trigger') {
     return runSyncTrigger(engine, args.slice(1));
   }
+  // #6340: the operator contract (status / unblock) reads and schedules; it never runs a sync.
+  if (args[0] === 'status' || args[0] === 'unblock') {
+    const { runSyncStatus, runSyncUnblock } = await import('./operator.ts');
+    return args[0] === 'status' ? runSyncStatus(engine, args.slice(1)) : runSyncUnblock(engine, args.slice(1));
+  }
 
   // v0.37 fix wave (Lane D.4 + CDX2-12): print usage when `--help`/`-h` is
   // passed. Pre-fix this was unreachable because the dispatcher's generic
@@ -71,6 +76,8 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
     printSyncHelp();
     return;
   }
+
+  if (args.includes('--acknowledge-managed')) return runAcknowledgeManaged(engine, args);
 
   const flags = parseSyncFlags(args);
   const { repoPath, dryRun, skipFailed, syncAll, jsonOut, breakLock, forceBreakLock, maxAgeSeconds } = flags;
@@ -128,7 +135,31 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   const resumeCommand = syncResumeCommand(args, getCliOptions().brain);
   if (syncAll) return await runSyncAll(engine, { ...flags, ...fanout }, { noEmbed, embeddingCredentialError, resumeCommand });
 
-  return await runSingleSourceSync(engine, { ...flags, ...fanout }, { sourceId, companyPolicy, noEmbed, resumeCommand });
+  return await runSingleSourceSync(engine, { ...flags, ...fanout }, { sourceId, companyPolicy, noEmbed, resumeCommand, args });
+}
+
+/** #6288: `gbrain sync --source <id> --acknowledge-managed <request_id|path>` removes only recorded failures the imported commit settles. */
+async function runAcknowledgeManaged(engine: BrainEngine, args: string[]): Promise<void> {
+  const { opError } = await import('../../core/ops/contract.ts');
+  const selector = args[args.indexOf('--acknowledge-managed') + 1];
+  const sourceId = args.find((a, i) => args[i - 1] === '--source');
+  const status = (id: string) => ({ argv: ['gbrain', 'sync', 'status', '--source', id, '--json'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+    why: 'Shows the recorded failure, its class and the exact sync that settles it, read-only.' });
+  if (!selector || selector.startsWith('--') || !sourceId) throw opError('invalid_params', '--acknowledge-managed needs --source <id> and a request id or path.',
+    `Name the source and one recorded failure's request id or path, for example gbrain sync --source ${sourceId ?? 'default'} --acknowledge-managed notes/a.md; gbrain sync status --source ${sourceId ?? 'default'} --json lists them.`,
+    sourceId ? { fix: status(sourceId) } : undefined);
+  const { acknowledgeManagedSyncFailures, readManagedSyncImported } = await import('../../core/persistence/sync-failures.ts');
+  const imported = await readManagedSyncImported(engine, sourceId);
+  if (!imported) throw opError('managed_failure_unsettled', `Source ${sourceId} has no successful managed sync yet, so nothing can be acknowledged.`,
+    `Run gbrain sync --no-pull --source ${sourceId} first; a recorded failure is acknowledged only when the imported commit settles it.`, { fix: status(sourceId) });
+  const result = await acknowledgeManagedSyncFailures(engine, imported, selector);
+  for (const failure of result.cleared) slog(`Acknowledged recorded failure ${failure.code} for ${failure.path} (request ${failure.request_id ?? '<not-admitted>'}): commit ${imported.target.slice(0, 12)} already imports it.`);
+  if (result.refused.length || !result.cleared.length) {
+    throw opError('managed_failure_unsettled', result.refused.length ? `${result.refused.length} recorded failure(s) for ${selector} are not settled by the imported state.` : `No recorded managed failure of source ${sourceId} matches ${selector}.`,
+      result.refused.length ? `Refused: ${result.refused.map(r => `${r.failure.path} (${r.reason})`).join(', ')}. The file still differs from what commit ${imported.target.slice(0, 12)} imported, its run is unfinished, or it is held; nothing was removed for it. Resume or retry that sync instead.`
+        : `Check the request id or path against gbrain sync status --source ${sourceId} --json; nothing was removed.`, { fix: status(sourceId) });
+  }
+  if (args.includes('--json')) await writeJsonDocument(JSON.stringify({ source_id: sourceId, imported_commit: imported.target, cleared: result.cleared }));
 }
 
 async function runSyncBreakLock(
@@ -328,9 +359,10 @@ async function runSyncAll(
   //     performSync get the [<source-id>] prefix under parallel mode (D6)
   //   - stable JSON envelope {schema_version:1, sources, ...} when --json
   // v0.41.31: v2Enabled resolved once above (cost gate). Reused here.
+  // P4.2: the same predicate the autopilot dispatchers use decides which sources this bulk run skips.
   const notApplicable: string[] = [];
   for (const s of sources) {
-    if (await syncContentDirectory(engine, { sourceId: s.id, repoPath: s.local_path ?? undefined })) notApplicable.push(s.id);
+    if ((await automaticSyncSkip(engine, s))?.reason === 'sync_not_applicable') notApplicable.push(s.id);
   }
   const activeSources = sources.filter((s) => !isSyncDisabledConfig(s.config) && !notApplicable.includes(s.id));
   const disabledCount = sources.filter((s) => isSyncDisabledConfig(s.config)).length;
@@ -527,8 +559,8 @@ async function runSyncAll(
   // capped at min(sourceCount, --max-sources, 8) in the parallel path.
   // #5984 (ENG-A14): managed sources drain one at a time. Parallel drains contend on the brain-wide
   // publication counters (55P03) and, at high RTT, made no progress at all.
-  const [persistence] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1').catch(() => []);
-  const managedSerial = fanOutEligible && persistence?.enabled === true && runnableSources.length > 1;
+  // #6482: no catch-to-unmanaged; an unknown persistence state refuses before any source is dispatched.
+  const managedSerial = fanOutEligible && runnableSources.length > 1 && await readManagedMode(engine);
   if (managedSerial) writeHuman('Managed brain: sources drain one at a time (parallel drains contend on the shared publication counters).');
   const effectiveParallel = fanOutEligible && !managedSerial
     ? Math.min(runnableSources.length, maxSources ?? 8)
@@ -713,14 +745,14 @@ function emitSyncAllEnvelope(input: {
 async function runSingleSourceSync(
   engine: BrainEngine,
   flags: SyncFlags & SyncFanoutFlags,
-  input: { sourceId: string; companyPolicy: Awaited<ReturnType<typeof getCompanyBrainProfile>> | null; noEmbed: boolean; resumeCommand: string },
+  input: { sourceId: string; companyPolicy: Awaited<ReturnType<typeof getCompanyBrainProfile>> | null; noEmbed: boolean; resumeCommand: string; args: string[] },
 ): Promise<void> {
   const {
     repoPath, watch, interval, dryRun, full, noPull, noBulk, lanes, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack,
     explicitProcessing, includeGitignored, workingTree, jsonOut, yesFlag, noAutoEmbed, strategyArg, srcSubpath,
     excludePatterns, includeHiddenPatterns, concurrency, timeoutSeconds,
   } = flags;
-  const { sourceId, companyPolicy, noEmbed, resumeCommand } = input;
+  const { sourceId, companyPolicy, noEmbed, resumeCommand, args } = input;
   // v0.41.13.0 (T6) — single-source --timeout: same per-source AbortController
   // shape as the --all runOne closure. Timer scoped to this CLI invocation;
   // try/finally clears it after performSync resolves (or throws).
@@ -788,9 +820,9 @@ async function runSingleSourceSync(
     // carry source_id (#1939), so a single-source retry shouldn't report
     // another source's failures.
     // A managed retry resumes only the cursor its own options select; failures under other options are named, not counted.
-    const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+    const managedBrain = await readManagedMode(engine);
     let failures: Array<{ source_id: string }> = unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
-    if (brain?.enabled) {
+    if (managedBrain) {
       const managed = await readManagedSyncFailures(engine, [sourceId]);
       const key = await managedSyncCursorKey(engine, opts).catch(() => null);
       const other = key ? managed.filter(f => f.cursor_key !== key) : [];
@@ -813,7 +845,10 @@ async function runSingleSourceSync(
     let result: SyncResult;
     process.on('SIGINT', onSingleSourceSigint);
     try {
-      result = await performSync(engine, opts);
+      // #6317 (D1 a′): on a managed Postgres brain whose host a live serve owns, the drain runs inside that serve as this
+      // CLI's writer and returns the same SyncResult; every other case keeps this process's own consumer.
+      const delegated = companyPolicy ? null : await (await import('../sync-delegate.ts')).maybeDelegateManagedSyncToServe(engine, args, opts);
+      result = delegated?.kind === 'delegated' ? delegated.result : await performSync(engine, opts);
     } finally {
       if (singleSourceTimer !== undefined) clearTimeout(singleSourceTimer);
       process.off('SIGINT', onSingleSourceSigint);

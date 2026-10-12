@@ -18,12 +18,14 @@ import { gbrainPath, loadConfig } from '../core/config.ts';
 import { LiveServeLockError, PgliteBusyError, peekLock } from '../core/pglite-lock.ts';
 import {
   acquireMigrationOrchestrationLock,
+  MigrationLeaseLostError,
   MIGRATIONS_RUNNING_EXIT_CODE,
   MigrationsRunningError,
   type MigrationOrchestrationLock,
 } from '../core/migration-orchestration-lock.ts';
 import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
+import { migrationDeclinedError, readDeclinedMigrations } from './migrations/opt-out.ts';
 import {
   indexCompletedEntries,
   statusForVersion as ledgerStatusForVersion,
@@ -37,6 +39,15 @@ import { writeJsonDocument } from '../core/cli-force-exit.ts';
 import { consentGate } from '../core/consent-cli.ts';
 import { opError, type OperationError } from '../core/ops/contract.ts';
 import { exitCliError, usageError, writeCliError } from '../cli/cli-error.ts';
+import {
+  checkSchemaAfterOrchestrators,
+  connectAtSchemaVersion,
+  redactDbError,
+  reportDatabaseUnreachable,
+  schemaBehindAtPreflight,
+  schemaPendingError,
+  type SchemaPending,
+} from './apply-migrations-schema.ts';
 
 interface ApplyMigrationsArgs {
   list: boolean;
@@ -173,7 +184,11 @@ Flags:
 
 Exit codes:
   0  Success (including "nothing to do").
-  1  An orchestrator failed, or schema migrations are pending (apply them with --yes).
+  1  An orchestrator failed, the migration lease stopped matching this run
+     (migration_lease_lost), or the run left the schema behind
+     (migrations_pending: not_applied → apply them with --yes; still_behind or
+     schema_unreadable → run gbrain doctor --json and report, not --yes again).
+     An unreachable Postgres stays 0 (GBRAIN_DB_ACCESS on stderr) unless --require-db.
   2  Invalid arguments.
   3  confirmation_required: a migration installs the autopilot service and the
      user has not approved it (--yes, --non-interactive or a preapproval).
@@ -209,6 +224,8 @@ interface Plan {
   pending_fresh_install: Migration[];
   skippedFuture: Migration[];
   wedged: Migration[];
+  /** #6466: declined by the brain's config (`Migration.optOut`); never run, listed as `declined`. */
+  declined: Migration[];
 }
 
 /**
@@ -222,18 +239,21 @@ interface Plan {
  *             after this version (fresh-install stamps). Runs like pending.
  * - skippedFuture: migration.version > installed VERSION (binary is older
  *                  than the migration; wait for a newer install).
+ * - declined: the brain's config turns the migration off (#6466); not
+ *             applied, partial or pending whatever the ledger says.
  *
  * Codex H9: we never compare against `current VERSION >` — that rule would
  * skip v0.11.0 when running v0.11.1. Compare against completed.jsonl.
  */
-function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: string): Plan {
-  const plan: Plan = { applied: [], partial: [], pending: [], pending_fresh_install: [], skippedFuture: [], wedged: [] };
+function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: string, declined: ReadonlySet<string> = new Set()): Plan {
+  const plan: Plan = { applied: [], partial: [], pending: [], pending_fresh_install: [], skippedFuture: [], wedged: [], declined: [] };
   for (const m of migrations) {
     if (filterVersion && m.version !== filterVersion) continue;
     if (compareVersions(m.version, installed) > 0) {
       plan.skippedFuture.push(m);
       continue;
     }
+    if (declined.has(m.version)) { plan.declined.push(m); continue; }
     const status = statusForVersion(m.version, idx);
     if (status === 'complete') plan.applied.push(m);
     else if (status === 'partial') plan.partial.push(m);
@@ -251,7 +271,7 @@ function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: strin
  */
 type DbProbeOutcome =
   | { status: 'connected'; schemaVer: number; latest: number }
-  | { status: 'unreachable'; reason: string }
+  | { status: 'unreachable'; reason: string; access?: string }
   | { status: 'skipped'; reason: string };
 
 function formatDbProbeLine(probe: DbProbeOutcome): string {
@@ -273,6 +293,7 @@ function listRows(plan: Plan): Array<{ status: string; m: Migration }> {
     ...plan.wedged.map(m => ({ status: 'wedged', m })),
     ...plan.pending.map(m => ({ status: 'pending', m })),
     ...plan.pending_fresh_install.map(m => ({ status: 'pending_fresh_install', m })),
+    ...plan.declined.map(m => ({ status: 'declined', m })),
     ...plan.skippedFuture.map(m => ({ status: 'future', m })),
   ];
 }
@@ -292,6 +313,7 @@ function printList(plan: Plan, installed: string, dbProbe: DbProbeOutcome): void
   console.log('');
   const needsWork = plan.pending.length + plan.partial.length;
   const setup = plan.pending_fresh_install.length;
+  for (const m of plan.declined) console.log(`v${m.version} is declined by config (${m.optOut?.key} is false); turn it back on: gbrain config set ${m.optOut?.key} true`);
   if (needsWork === 0 && setup === 0) {
     console.log('All migrations up to date.');
     return;
@@ -315,6 +337,7 @@ function listJson(plan: Plan, idx: CompletedIndex, installed: string, dbProbe: D
       status: r.status,
       headline: r.m.featurePitch.headline,
       ...(r.status === 'applied' && (idx.byVersion.get(r.m.version) ?? []).some(isFreshInstallStamp) ? { fresh_install: true } : {}),
+      ...(r.status === 'declined' && r.m.optOut ? { opt_out: { key: r.m.optOut.key } } : {}),
     })),
     needs_action: plan.pending.length + plan.partial.length,
     pending_fresh_install: plan.pending_fresh_install.length,
@@ -344,6 +367,11 @@ function printDryRun(plan: Plan, installed: string, dbProbe: DbProbeOutcome): vo
   if (plan.pending_fresh_install.length) {
     console.log('Would APPLY (pending_fresh_install — setup a brain created by gbrain init has not run yet; expected, not a failed upgrade):');
     for (const m of plan.pending_fresh_install) console.log(`  → v${m.version} — ${m.featurePitch.headline}`);
+    console.log('');
+  }
+  if (plan.declined.length) {
+    console.log('Declined by config (not run; turn one back on with gbrain config set <key> true):');
+    for (const m of plan.declined) console.log(`  ⊘ v${m.version} — ${m.optOut?.key} is false`);
     console.log('');
   }
   if (plan.skippedFuture.length) {
@@ -514,12 +542,25 @@ export async function applyMigrations(args: string[]): Promise<{ exitCode: numbe
     await holdLock();
     exitCode = await runLockedMigrations(cli, installed, holdLock, () => held.lock, report, args);
   } catch (error) {
-    if (!(error instanceof MigrationsRunningError)) throw error;
-    console.error(`apply-migrations refused: ${error.message}`);
-    report.doc.status = 'refused';
-    report.failure = opError('migrations_running', error.message,
-      'Wait for the other apply-migrations run to finish, then run `gbrain apply-migrations` again (it resumes where that run stopped).');
-    exitCode = MIGRATIONS_RUNNING_EXIT_CODE;
+    if (error instanceof MigrationLeaseLostError) {
+      console.error(`apply-migrations stopped: ${error.message}`);
+      report.doc.status = 'lease_lost';
+      report.doc.lease = error.details;
+      report.failure = opError('migration_lease_lost', error.message,
+        'Run `gbrain doctor --json` and report this to the user with the lease details; do not delete the lease row or rerun in a loop.',
+        { why: 'The migration lease row still names this run, but its fenced refresh matched nothing, so mutual exclusion can no longer be proven (#6028).',
+          fix: { consent: [], actor: 'agent', requires_exclusive: false, why: 'Tell the user the migration lease no longer matched its own fence and what doctor reports.',
+            verify: { argv: ['gbrain', 'doctor', '--json'] } } });
+      exitCode = 1;
+    } else if (error instanceof MigrationsRunningError) {
+      console.error(`apply-migrations refused: ${error.message}`);
+      report.doc.status = 'refused';
+      report.failure = opError('migrations_running', error.message,
+        'Wait for the other apply-migrations run to finish, then run `gbrain apply-migrations` again (it resumes where that run stopped).');
+      exitCode = MIGRATIONS_RUNNING_EXIT_CODE;
+    } else {
+      throw error;
+    }
   } finally {
     await held.lock?.release();
   }
@@ -596,18 +637,15 @@ async function runLockedMigrations(
   // recovery path.
   if (cli.forceSchema || cli.forceAll) {
     try {
-      const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
-      const { createEngine } = await import('../core/engine-factory.ts');
-      const cfg = lc();
+      const cfg = loadConfig();
       if (!cfg) {
         console.error('No brain configured for --force-schema.');
         fail('failed', opError('no_brain', 'No brain configured for --force-schema.', 'Create a brain first: `gbrain init` (`gbrain init --help` lists the options).'));
         return 2;
       }
-      const eng = await createEngine(toEngineConfig(cfg));
-      await eng.connect(toEngineConfig(cfg));
+      const { engine: eng, version } = await connectAtSchemaVersion(cfg);
       console.log('Running schema migrations from current config.version...');
-      const result = await migrateSchema(eng, parseInt(await eng.getConfig('version') || '1', 10));
+      const result = await migrateSchema(eng, version);
       console.log(`Applied ${result.applied} schema migration(s); now at v${result.current}.`);
       doc.schema = result;
       await eng.disconnect();
@@ -626,27 +664,22 @@ async function runLockedMigrations(
 
   const completed = loadCompletedMigrations();
   const idx = indexCompleted(completed);
-  const plan = buildPlan(idx, installed, cli.specificMigration);
+  const declined = await readDeclinedMigrations(loadConfig()!);
+  const plan = buildPlan(idx, installed, cli.specificMigration, declined);
 
   doc.database = dbProbe;
   doc.plan = Object.fromEntries(Object.entries(plan).map(([state, entries]) => [state, entries.map((migration: Migration) => migration.version)]));
-  // Bug 3 — surface wedged migrations as a loud, actionable error.
-  if (plan.wedged.length > 0) {
-    for (const m of plan.wedged) {
-      console.error(
-        `\nMigration v${m.version} is WEDGED (${MAX_CONSECUTIVE_PARTIALS}+ consecutive partials with no completion). ` +
-        `Check ~/.gbrain/upgrade-errors.jsonl for the last failure reasons, fix the underlying issue, then run:\n` +
-        `  gbrain apply-migrations --force-retry ${m.version}\n` +
-        `Then run \`gbrain apply-migrations\` again (it asks for any approval the migration needs).`,
-      );
-    }
-    // Don't exit — applied/partial/pending are still worth reporting and running.
-  }
+  reportWedgedMigrations(plan.wedged);
 
-  if (cli.specificMigration && plan.applied.length + plan.partial.length + plan.pending.length + plan.pending_fresh_install.length + plan.skippedFuture.length === 0) {
+  if (cli.specificMigration && plan.applied.length + plan.partial.length + plan.pending.length + plan.pending_fresh_install.length + plan.skippedFuture.length + plan.declined.length === 0) {
     console.error(`No migration registered with version "${cli.specificMigration}". Run \`gbrain apply-migrations --list\` to see registered versions.`);
     fail('invalid', unknownMigrationError(cli.specificMigration));
     return 2;
+  }
+  // #6466: an explicit run of a declined migration refuses (T1) instead of overriding brain-level config every machine shares.
+  if (cli.specificMigration && plan.declined.length > 0 && !cli.list && !cli.dryRun) {
+    fail('declined', migrationDeclinedError(plan.declined[0]!));
+    return writeCliError(report.failure, COMMAND, { json: cli.json });
   }
 
   // #4364: --require-db turns an unreachable DB into a hard failure instead
@@ -678,27 +711,28 @@ async function runLockedMigrations(
     console.error('--require-db: database is unreachable; aborting before orchestrators run.');
     return 1;
   }
+  if (dbProbe.status === 'unreachable') reportDatabaseUnreachable(dbProbe);
 
   // A Postgres schema without gbrain_cycle_locks had no lease yet; the
   // preflight above created the table, so take the lease before orchestrating.
   await holdLock();
 
-  const toRun: Migration[] = [...plan.partial, ...plan.pending, ...plan.pending_fresh_install, ...plan.applied.filter(migration => migration.reconcile)]
+  // #6089: an applied reconcile re-check is not pending work. With nothing
+  // else pending, a schema the pre-flight left behind fails the run here; the
+  // re-check runs on the next run, once the schema is current.
+  const pendingWork = [...plan.partial, ...plan.pending, ...plan.pending_fresh_install];
+  const authorized = cli.yes || cli.nonInteractive;
+  if (schemaBehind && pendingWork.length === 0 && dbProbe.status === 'connected') {
+    return failSchemaBehind(report, args, await schemaBehindAtPreflight(dbProbe.schemaVer, authorized));
+  }
+  const toRun: Migration[] = [...pendingWork, ...plan.applied.filter(migration => migration.reconcile)]
     .sort((left, right) => compareVersions(left.version, right.version));
   if (toRun.length === 0) {
-    if (schemaBehind) {
-      console.error(
-        'Orchestrator migrations are up to date, but schema migrations are behind. ' +
-        'Run `gbrain apply-migrations --yes` (or `--force-schema`) to apply them.',
-      );
-      fail('schema_behind', schemaBehindError(args));
-      return 1;
-    }
     console.log('All migrations up to date.');
     doc.status = 'up_to_date';
     return 0;
   }
-  if (!schemaBehind && plan.pending.length === 0 && plan.pending_fresh_install.length === 0 && plan.partial.length === 0) {
+  if (!schemaBehind && pendingWork.length === 0) {
     console.log('All migrations up to date. This covers orchestrator checkpoints only; host publication and client activation are being rechecked.');
   }
 
@@ -827,8 +861,20 @@ async function runLockedMigrations(
     }
   }
 
-  if (!failed && schemaBehind) doc.schema_behind = true;
-  return failed ? 1 : undefined;
+  if (failed) return 1;
+  // #6089: an orchestrator may migrate the schema itself, so read it again.
+  return failSchemaBehind(report, args, await checkSchemaAfterOrchestrators({
+    cfg: loadConfig()!, authorized, preflightVersion: dbProbe.status === 'connected' ? dbProbe.schemaVer : null, apply: migrateSchema,
+  }));
+}
+
+/** #6089: the run leaves the schema behind → `migrations_pending`, exit 1; undefined (success) when it does not. */
+function failSchemaBehind(report: RunReport, args: readonly string[], pending: SchemaPending | null): number | undefined {
+  if (!pending) return undefined;
+  report.doc.status = 'schema_behind';
+  report.doc.schema_pending = pending;
+  report.failure = schemaPendingError(pending, rerunFix(args, 'Applies the pending schema migrations (no consent effect; it migrates the brain\'s own schema).', true));
+  return 1;
 }
 
 /**
@@ -848,27 +894,23 @@ async function preflightSchema(
   // to handle everything (Issue 1 from v0.18.0 field report; #1530). With
   // --yes/--non-interactive we apply them here; otherwise we warn and make
   // sure the run does NOT report "All migrations up to date" with exit 0.
+  const cfg = loadConfig();
   try {
     const { LATEST_VERSION } = await import('../core/migrate.ts');
-    const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
-    const { createEngine } = await import('../core/engine-factory.ts');
-    const cfg = lc();
     if (cfg) {
       // v0.36.x #1100: skip the pre-flight warning on PGLite. The probe
       // briefly holds the single-writer lock; if a downstream orchestrator
       // phase spawns `gbrain init --migrate-only` as a subprocess (the
       // legacy v0.11.0 phase A path), the child can race the parent's
       // lock release and hit a 30s timeout. The orchestrators handle
-      // schema lifecycle internally on PGLite (phase A routes in-process),
-      // so the warning here adds no information for PGLite users.
+      // schema lifecycle internally on PGLite (phase A routes in-process).
+      // #6089: PGLite's schema version is checked in-process after the
+      // orchestrators released the datastore (checkSchemaAfterOrchestrators).
       const skipPreflight = cfg.engine === 'pglite';
       if (skipPreflight) {
         dbProbe = { status: 'skipped', reason: 'pglite manages schema in-process' };
       } else {
-        const eng = await createEngine(toEngineConfig(cfg));
-        await eng.connect(toEngineConfig(cfg));
-        const verStr = await eng.getConfig('version');
-        const schemaVer = parseInt(verStr || '1', 10);
+        const { engine: eng, version: schemaVer } = await connectAtSchemaVersion(cfg);
         dbProbe = { status: 'connected', schemaVer, latest: LATEST_VERSION };
         schemaBehind = await resolveSchemaBehind({
           schemaVer,
@@ -886,26 +928,32 @@ async function preflightSchema(
     // still run their filesystem-only phases. #4364: keep the (redacted)
     // reason so --list/--dry-run say UNREACHABLE and --require-db fails hard —
     // connect errors are exactly what users paste into issues and CI logs.
-    const { redactUrlsInText } = await import('../core/url-redact.ts');
-    const { redactConnectionInfo } = await import('../core/audit/redact-connection-info.ts');
+    const { classifyPgAccessError } = await import('../core/pg-access-classify.ts');
     dbProbe = {
       status: 'unreachable',
-      reason: redactConnectionInfo(redactUrlsInText(err instanceof Error ? err.message : String(err))),
+      reason: await redactDbError(err),
+      access: classifyPgAccessError(err, { url: cfg?.database_url ?? null }).reason,
     };
   }
   return { schemaBehind, dbProbe };
+}
+
+/** Bug 3 — surface wedged migrations as a loud, actionable error; the run continues (applied/partial/pending are still reported and run). */
+function reportWedgedMigrations(wedged: readonly Migration[]): void {
+  for (const m of wedged) {
+    console.error(
+      `\nMigration v${m.version} is WEDGED (${MAX_CONSECUTIVE_PARTIALS}+ consecutive partials with no completion). ` +
+      `Check ~/.gbrain/upgrade-errors.jsonl for the last failure reasons, fix the underlying issue, then run:\n` +
+      `  gbrain apply-migrations --force-retry ${m.version}\n` +
+      `Then run \`gbrain apply-migrations\` again (it asks for any approval the migration needs).`,
+    );
+  }
 }
 
 function requireDbError(dbProbe: DbProbeOutcome): OperationError {
   return opError('database_error', `${formatDbProbeLine(dbProbe)}; --require-db stops the run before any orchestrator runs.`,
     'Fix the database connection (run `gbrain db-repair` to diagnose it), then run apply-migrations again.',
     { fix: { argv: ['gbrain', 'db-repair', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Diagnoses the database access failure and names the repair.' } });
-}
-
-function schemaBehindError(args: readonly string[]): OperationError {
-  return opError('migrations_pending', 'Orchestrator migrations are up to date, but schema migrations are behind; this run did not apply them.',
-    'Apply them with `gbrain apply-migrations --yes` (or `--force-schema`).',
-    { fix: rerunFix(args, 'Applies the pending schema migrations (no consent effect; it migrates the brain\'s own schema).', true) });
 }
 
 /**

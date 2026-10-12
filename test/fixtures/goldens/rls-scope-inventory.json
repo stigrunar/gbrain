@@ -201,6 +201,19 @@
           "src-a"
         ]
       },
+      "countStaleFrontmatterKeyPages#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
       "countStalePagesForExtraction#attendance-blocked+sourceId": {
         "flagOffLanes": [
           "pool"
@@ -500,6 +513,19 @@
           "src-a"
         ]
       },
+      "findDuplicatePages#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
       "findOntologyConflicts#default": {
         "flagOffLanes": [
           "pool"
@@ -721,6 +747,17 @@
         ],
         "flagOnScopes": []
       },
+      "getCalleesOf#chunkId": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
       "getCalleesOf#default": {
         "flagOffLanes": [
           "pool"
@@ -733,6 +770,17 @@
         "flagOnScopes": []
       },
       "getCalleesOf#sourceId": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "getCallersOf#chunkId": {
         "flagOffLanes": [
           "pool"
         ],
@@ -998,9 +1046,10 @@
       },
       "getHealth#default": {
         "flagOffLanes": [
-          "pool"
+          "pool",
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
           "pool",
@@ -2184,6 +2233,19 @@
           "src-a"
         ]
       },
+      "listStaleFrontmatterKeyPages#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
       "listStalePagesForExtraction#afterPageId+versionTs+sourceId": {
         "flagOffLanes": [
           "pool"
@@ -2459,6 +2521,19 @@
           "src-a"
         ]
       },
+      "readPageSnapshotsBatch#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
       "refreshPageBody#default": {
         "flagOffLanes": [
           "pool"
@@ -2537,6 +2612,21 @@
         "flagOnScopes": []
       },
       "replaceDerivedLinks#default": {
+        "flagOffLanes": [
+          "tx",
+          "tx>sp"
+        ],
+        "flagOffOpensTransaction": true,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx",
+          "tx>sp"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
+      "replaceDerivedLinksBatch#default": {
         "flagOffLanes": [
           "tx",
           "tx>sp"
@@ -2707,11 +2797,13 @@
       },
       "searchKeyword#cjk": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2720,11 +2812,13 @@
       },
       "searchKeyword#cjk+sourceIds+detailLow": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2733,11 +2827,13 @@
       },
       "searchKeyword#fts": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2746,11 +2842,13 @@
       },
       "searchKeyword#fts+orFallback": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2760,11 +2858,13 @@
       },
       "searchKeyword#fts+sourceIds": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2903,6 +3003,7 @@
         ],
         "flagOnScopes": [
           "src-a",
+          "src-a",
           "src-a"
         ]
       },
@@ -2980,6 +3081,17 @@
         "flagOnScopes": []
       },
       "softDeletePages#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "stripStaleFrontmatterKeys#default": {
         "flagOffLanes": [
           "pool"
         ],
@@ -3327,13 +3439,16 @@
       }
     },
     "static": {
-      "callSites": 23,
+      "callSites": 29,
       "directMethods": {
         "_searchKeywordCJK": 1,
         "countChunklessPagesWithContent": 1,
+        "countKeywordPages": 1,
         "countStaleChunks": 1,
+        "countStaleFrontmatterKeyPages": 1,
         "countStalePagesForExtraction": 1,
         "findDuplicatePage": 1,
+        "findDuplicatePages": 1,
         "getAllSlugs": 1,
         "getBacklinks": 1,
         "getChunkWindows": 1,
@@ -3345,11 +3460,14 @@
         "listPages": 1,
         "listPrefixSampledPages": 1,
         "listStaleChunks": 1,
+        "listStaleFrontmatterKeyPages": 1,
         "listStalePagesForExtraction": 1,
         "readPageSnapshot": 1,
+        "readPageSnapshotsBatch": 1,
         "runVectorAttempt": 1,
         "searchKeyword": 1,
         "searchKeywordChunks": 1,
+        "searchKeywordPages": 1,
         "searchTitles": 1,
         "searchVector": 1
       },
@@ -3373,7 +3491,9 @@
         "connect": "none",
         "consolidateFact": "none",
         "countChunklessPagesWithContent": "direct",
+        "countKeywordPages": "direct",
         "countStaleChunks": "direct",
+        "countStaleFrontmatterKeyPages": "direct",
         "countStalePagesForExtraction": "direct",
         "countStaleTakes": "none",
         "countUnconsolidatedFacts": "none",
@@ -3397,6 +3517,7 @@
         "findByTitleFuzzy": "none",
         "findCandidateDuplicates": "none",
         "findDuplicatePage": "direct",
+        "findDuplicatePages": "direct",
         "findOntologyConflicts": "none",
         "findOrphanPages": "none",
         "findTrajectory": "none",
@@ -3447,6 +3568,7 @@
         "insertFacts": "none",
         "invalidateContentDriftEmbeddings": "none",
         "invalidateStaleSignatureEmbeddings": "none",
+        "jitOffRead": "none",
         "listActiveTakesForPages": "none",
         "listAllPageRefs": "none",
         "listAllSources": "none",
@@ -3465,6 +3587,7 @@
         "listPages": "direct",
         "listPrefixSampledPages": "direct",
         "listStaleChunks": "direct",
+        "listStaleFrontmatterKeyPages": "direct",
         "listStalePagesForExtraction": "direct",
         "listStaleTakes": "none",
         "listSupersessions": "none",
@@ -3485,6 +3608,7 @@
         "putPage": "none",
         "putRawData": "none",
         "readPageSnapshot": "direct",
+        "readPageSnapshotsBatch": "direct",
         "reconnect": "none",
         "refreshPageBody": "none",
         "registerBeforeDisconnect": "none",
@@ -3494,6 +3618,7 @@
         "removeLinksByPagesAndSource": "none",
         "removeTag": "none",
         "replaceDerivedLinks": "none",
+        "replaceDerivedLinksBatch": "none",
         "resolveAliases": "none",
         "resolveFactsEmbeddingCast": "none",
         "resolveSlugWithAlias": "none",
@@ -3510,6 +3635,7 @@
         "runVectorAttempt": "direct",
         "searchKeyword": "direct",
         "searchKeywordChunks": "direct",
+        "searchKeywordPages": "direct",
         "searchTakes": "none",
         "searchTakesVector": "none",
         "searchTitles": "direct",
@@ -3521,6 +3647,7 @@
         "softDeletePage": "none",
         "softDeletePages": "none",
         "sql": "none",
+        "stripStaleFrontmatterKeys": "none",
         "sumStaleChunkChars": "none",
         "supersedeTake": "none",
         "sweepContradictionCache": "none",

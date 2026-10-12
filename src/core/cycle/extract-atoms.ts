@@ -77,7 +77,7 @@ import type { MaintenanceWriteWait } from '../persistence/maintenance-wait.ts';
 import { connectorAtomExclusionSql } from './connector-atoms.ts';
 import { resolveExtractAtomsCostGate, resolveEmbedModelForCostGate, settleExtractAtomsCostGate } from './extract-atoms-cost-gate.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
-import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { classifyRunStop, providerHaltReason, upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { abortableSleep } from '../retry.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { createHash } from 'crypto';
@@ -92,8 +92,10 @@ import { effectiveVisibility } from '../search/private-visibility.ts';
 import { OperationError } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
-import { AtomPageStateError, completeAtomReceipts, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
+import { AtomPageStateError, completeAtomReceipts, MAX_DETERMINISTIC_FAILURES, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { deriveTrust, lowerDerivedPage } from '../trust/taint.ts';
+import { derivedGateInput } from '../trust/derived-gate.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
@@ -106,12 +108,7 @@ const DEFAULT_BUDGET_USD = 0.3;
 export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 50_000;
 export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096;
 
-/**
- * gbrain#4148: consecutive same-content failures of a content-deterministic
- * class (malformed model output or provider content block) before the page is tombstoned so the
- * backlog floor can clear. A content edit resets the streak.
- */
-export const MAX_DETERMINISTIC_FAILURES = 3;
+export { MAX_DETERMINISTIC_FAILURES };
 
 /**
  * Transient provider/infra failure shapes — retryable, never counted.
@@ -138,6 +135,10 @@ const SYNTHESIS_OUTPUT_TYPES = new Set<string>(['atom', 'concept']);
 
 const PAGE_DISCOVERY_BUDGET = 50;
 const MIN_PAGE_CHARS_FOR_EXTRACTION = 500;
+/** `compiled_truth` has >= `param` characters: octet_length reads a TOASTed size from its header and a character is
+ *  1-4 bytes, so only bodies of param..4x param bytes are decompressed (length() decompressed all: 1.3 s at 50k). */
+const minCompiledTruthChars = (param: string) =>
+  `(octet_length(p.compiled_truth) >= 4 * ${param} OR (octet_length(p.compiled_truth) >= ${param} AND length(p.compiled_truth) >= ${param}))`;
 // Source pages whose frontmatter declares a `raw` payload pointer hold raw
 // import data, not extractable prose. Extraction on them yields zero atoms,
 // so no atom row is ever written and they re-enter discovery + the doctor
@@ -154,11 +155,13 @@ const PAGE_SCAN_STATE_EXCLUSION_SQL = `AND NOT EXISTS (
 )`;
 
 /**
- * Pure allowlist policy: the legacy floor UNION the pack's `extractable: true`
- * types, MINUS synthesis outputs. Exported for unit tests; keep I/O-free.
+ * Pure allowlist policy: the legacy floor (minus floor types the pack declares not extractable, #5756: the floor
+ * covers only types the pack is silent about) UNION the pack's `extractable: true` types, MINUS synthesis outputs.
+ * Exported for unit tests; keep I/O-free.
  */
-export function unionExtractableTypes(packExtractable: Iterable<string>): string[] {
+export function unionExtractableTypes(packExtractable: Iterable<string>, packExcluded: Iterable<string> = []): string[] {
   const types = new Set<string>(LEGACY_EXTRACTABLE_TYPES);
+  for (const t of packExcluded) types.delete(t);
   for (const t of packExtractable) types.add(t);
   for (const t of SYNTHESIS_OUTPUT_TYPES) types.delete(t);
   return [...types];
@@ -172,17 +175,17 @@ export function unionExtractableTypes(packExtractable: Iterable<string>): string
  * back to the legacy floor.
  */
 async function resolveExtractableTypes(): Promise<string[]> {
-  let packExtractable: Iterable<string> = [];
+  let packExtractable: Iterable<string> = [], packExcluded: Iterable<string> = [];
   try {
     const { loadConfig } = await import('../config.ts');
     const { loadActivePack } = await import('../schema-pack/load-active.ts');
-    const { extractableTypesFromPack } = await import('../schema-pack/extractable.ts');
+    const { extractableTypesFromPack, nonExtractableTypesFromPack } = await import('../schema-pack/extractable.ts');
     const resolved = await loadActivePack({ cfg: loadConfig(), remote: false });
-    packExtractable = extractableTypesFromPack(resolved.manifest);
+    packExtractable = extractableTypesFromPack(resolved.manifest); packExcluded = nonExtractableTypesFromPack(resolved.manifest);
   } catch {
     // Pack unavailable (test seams, bootstrap) — legacy floor only.
   }
-  return unionExtractableTypes(packExtractable);
+  return unionExtractableTypes(packExtractable, packExcluded);
 }
 
 export interface ExtractAtomsOpts {
@@ -410,7 +413,7 @@ export async function discoverExtractablePages(
       AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
       AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
       ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
-      AND length(COALESCE(p.compiled_truth, '')) >= $3
+      AND ${minCompiledTruthChars('$3')}
       ${MANAGED_ATOM_DISCOVERY_SQL}
       ${PAGE_SCAN_STATE_EXCLUSION_SQL}
       ${connectorExclusion}
@@ -494,7 +497,7 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
-           AND length(COALESCE(p.compiled_truth, '')) >= $3
+           AND ${minCompiledTruthChars('$3')}
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
            ${connectorExclusion}
@@ -512,7 +515,7 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
-           AND length(COALESCE(p.compiled_truth, '')) >= $2
+           AND ${minCompiledTruthChars('$2')}
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
            ${connectorExclusion}
@@ -976,7 +979,7 @@ export async function runPhaseExtractAtoms(
   }
 
   // ── gbrain#4148 helpers ────────────────────────────────────────────
-  let malformedOutputs = 0;
+  let malformedOutputs = 0, stoppedOutputs = 0; // #6260: stopped = clipped, or empty under an unconfirmed stop
   const tombstonedForFailures: string[] = [];
   // v146: transcript tombstones ride a SEPARATE array. `tombstoned_for_failures`
   // is a list of page SLUGS; transcripts are filesystem paths, and mixing the two
@@ -994,6 +997,7 @@ export async function runPhaseExtractAtoms(
   // say are "retryable, never counted" — see that regex's doc comment.
   let hardFailureCount = 0;
   let writesPending = 0; // #5601: accepted atom batches still publishing (progress, not failures)
+  let heldFailed = 0;
 
   async function stampAtomsScanHash(item: AtomPageInput): Promise<void> {
     await writeAtomPageState(engine, sourceId, item, 'complete');
@@ -1108,10 +1112,10 @@ export async function runPhaseExtractAtoms(
       const visibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
         : { kind: 'page', page: await engine.getPage(item.slug, { sourceId }) });
       throwIfAborted(opts.signal, 'extract_atoms');
-      if (!opts.dryRun && managed && origin && await resumeManagedAtoms(engine, managed, origin)) {
-        duplicatesSkipped++;
-        continue;
-      }
+      const resumed = !opts.dryRun && managed && origin ? await resumeManagedAtoms(engine, managed, origin) : 'run';
+      if (resumed === 'done') { duplicatesSkipped++; continue; }
+      if (resumed === 'held') { heldFailed++; continue; } // #6325: settled after repeated failures; doctor lists it
+
       const result = await chat({
         model: extractModel,
         ...atomsPrompt(dateGrounding, originLabel, promptContent),
@@ -1132,11 +1136,11 @@ export async function runPhaseExtractAtoms(
 
       // gbrain#4148: typed outcome — malformed output is a FAILURE (counted
       // toward the bounded tombstone below), never a zero-yield success.
-      const parseOutcome = parseAtomsOutcome(result.text);
+      const parseOutcome = parseAtomsOutcome(result.text, result.stopReason);
       if (!parseOutcome.ok) {
-        malformedOutputs++;
+        if (parseOutcome.stopped) stoppedOutputs++; else malformedOutputs++;
         if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
-        await recordDeterministicFailure(item, originLabel, `malformed model output: ${parseOutcome.reason}`);
+        await recordDeterministicFailure(item, originLabel, parseOutcome.stopped ? parseOutcome.reason : `malformed model output: ${parseOutcome.reason}`);
         continue;
       }
       const atoms = parseOutcome.atoms;
@@ -1250,16 +1254,15 @@ export async function runPhaseExtractAtoms(
               ...(atom.emotional_register && { emotional_register: atom.emotional_register }),
               extracted_at: new Date().toISOString(),
               extracted_by: 'extract_atoms-v0.41.2.1',
+              dream_generated: true, // #5211: the flag every anti-loop guard keys on
             },
             atom.body,
             '',
             { type: 'atom', title: atom.title, tags: [] },
           );
           if (managed) managedAtoms.push({ slug, content: md, links: [] });
-          else await importFromContent(engine, slug, md, {
-              sourceId,
-              noEmbed: !isAvailable('embedding'),
-            });
+          else { const taint = await deriveTrust(engine, item.kind === 'page' ? [{ table: 'pages', sourceId, slug: item.slug }] : [], { channel: 'derive:atoms' }); // #5575 I2/B3: gated and stamped at the origin's taint
+            await importFromContent(engine, slug, md, { sourceId, preserveGateMarkers: true, noEmbed: !isAvailable('embedding'), writeGate: derivedGateInput(taint.trust) }).then(() => lowerDerivedPage(engine, taint, sourceId, slug)); }
           importedSlugs.push(slug);
           if (item.kind === 'page') {
             provenanceLinks.push({
@@ -1418,7 +1421,7 @@ export async function runPhaseExtractAtoms(
       kind: 'atoms',
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      ...classifyRunStop({ deadline_hit: stoppedEarly, error: hardFailureCount > 0 }),
+      ...classifyRunStop({ deadline_hit: stoppedEarly, error: hardFailureCount > 0 ? providerHaltReason(abortedGlobalError) ?? 'item_error' : false }),
     });
   }
 
@@ -1453,10 +1456,11 @@ export async function runPhaseExtractAtoms(
       pages_skipped_budget: pagesSkipped,
       duplicates_skipped: duplicatesSkipped,
       write_pending: writesPending,
+      held_failed: heldFailed,
       failures,
       ...(managed ? { write_requests: writeRequests } : {}),
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
-      malformed_outputs: malformedOutputs,
+      malformed_outputs: malformedOutputs, stopped_outputs: stoppedOutputs,
       tombstoned_for_failures: tombstonedForFailures,
       tombstoned_transcripts: tombstonedTranscripts,
       estimated_spend_usd: estimatedSpendUsd,

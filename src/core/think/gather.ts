@@ -16,10 +16,13 @@
  */
 
 import type { BrainEngine, TakeHit, Take } from '../engine.ts';
+import type { TrustTier } from '../trust/tier.ts';
+import { EXTERNAL_DATA_RULE, needsDataEnvelope, trustAttributes } from '../eligibility/labels.ts';
 import { hybridSearch } from '../search/hybrid.ts';
 import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import type { Page, SearchResult } from '../types.ts';
+import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget } from './pages-budget.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
 import { pageContentDate } from './temporal-context.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
@@ -196,6 +199,7 @@ export async function runGather(
   const takesKwPromise = engine.searchTakes(opts.question, {
     limit: takesLimit,
     ...pageScope,
+    eligibility: {},
   }).catch((e) => {
     warnings.push('GATHER_TAKES_KEYWORD_FAILED');
     process.stderr.write(`[think.gather] takes-keyword stream failed: ${(e as Error).message}\n`);
@@ -207,6 +211,7 @@ export async function runGather(
     ? engine.searchTakesVector(opts.questionEmbedding, {
         limit: takesLimit,
         ...pageScope,
+        eligibility: {},
       }).catch((e) => {
         warnings.push('GATHER_TAKES_VECTOR_FAILED');
         process.stderr.write(`[think.gather] takes-vector stream failed: ${(e as Error).message}\n`);
@@ -583,17 +588,17 @@ export function selectRelevantExcerptDetailed(
  * budget-aware: `min(ceiling, totalBudget / pageCount)` with the caller's
  * `floor` as the guaranteed minimum, so a big gather never collapses each
  * page below the floor, and a small gather delivers each page in a much
- * larger (often complete) window instead of wasting the budget.
+ * larger (often complete) window instead of wasting the budget. The total
+ * is therefore a SOFT bound (40 pages × the 600 floor = 24 000 at the
+ * 12 000 default). #5461: `budget` comes from `think.pages_budget_chars` /
+ * `think.excerpt_ceiling_chars` (pages-budget.ts); the defaults are the
+ * historical constants.
  */
-const PAGES_BLOCK_TOTAL_BUDGET_CHARS = 12_000;
-const PAGES_BLOCK_EXCERPT_CEILING_CHARS = 2_400;
-
-/** Budget-aware per-page excerpt length for the pages block (#4510). */
-export function pagesBlockExcerptLen(pageCount: number, floor = 600): number {
+export function pagesBlockExcerptLen(pageCount: number, floor = PAGES_BLOCK_EXCERPT_FLOOR_CHARS, budget: PagesBudget = DEFAULT_PAGES_BUDGET): number {
   if (pageCount <= 0) return floor;
   return Math.max(floor, Math.min(
-    PAGES_BLOCK_EXCERPT_CEILING_CHARS,
-    Math.floor(PAGES_BLOCK_TOTAL_BUDGET_CHARS / pageCount),
+    budget.ceilingChars,
+    Math.floor(budget.totalChars / pageCount),
   ));
 }
 
@@ -619,7 +624,22 @@ export function renderPagesBlock(
   query = '',
   opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number; timeZone?: string } = {},
 ): string {
-  return pages.map((p, idx) => {
+  return renderPagesBlockDetailed(pages, excerptLen, query, opts).text;
+}
+
+/**
+ * `renderPagesBlock` plus `truncated`: true when any page was shown in part
+ * (an excerpt cut at either end, or a verbatim block over its cap). #5461:
+ * the think result reports it as `evidence_truncated`.
+ */
+export function renderPagesBlockDetailed(
+  pages: SearchResult[],
+  excerptLen = 600,
+  query = '',
+  opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number; timeZone?: string } = {},
+): { text: string; truncated: boolean } {
+  let truncated = false;
+  const text = pages.map((p, idx) => {
     const day = pageContentDate(p, opts.timeZone ?? 'UTC');
     const dateAttr = day ? ` date="${day}"` : '';
     const page = p as unknown as {
@@ -633,11 +653,15 @@ export function renderPagesBlock(
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
     const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
-    const flag = (p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '') + graphEvidenceLine(p);
+    const flag = (p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '')
+      + (p.trust_tier && needsDataEnvelope(p.trust_tier) ? `${EXTERNAL_DATA_RULE}\n` : '') + graphEvidenceLine(p);
+    const trustAttr = p.trust_tier ? ` ${trustAttributes({ trust_tier: p.trust_tier, origin: p.origin ?? 'legacy' })}` : '';
     // Evidence delivery: the block was already budgeted and cut around its
     // hits; render it whole (capped only by excerptLen).
     if (typeof opts.verbatim === 'function' ? opts.verbatim(p) : opts.verbatim) {
-      return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}>\n${flag}${content.slice(0, opts.verbatimLen ?? excerptLen)}\n</page>`;
+      const cap = opts.verbatimLen ?? excerptLen;
+      if (content.length > cap || (p as { delivered?: { truncated?: boolean } }).delivered?.truncated === true) truncated = true;
+      return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}${trustAttr}>\n${flag}${content.slice(0, cap)}\n</page>`;
     }
     const excerpt = selectRelevantExcerptDetailed(
       content,
@@ -645,12 +669,14 @@ export function renderPagesBlock(
       excerptLen,
       `${title} ${slugIdentity}`,
     );
+    if (excerpt.truncatedStart || excerpt.truncatedEnd) truncated = true;
     const body =
       (excerpt.truncatedStart ? `${EXCERPT_CUT_START_MARKER}\n` : '') +
       excerpt.text +
       (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
-    return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}>\n${flag}${body}\n</page>`;
+    return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}${trustAttr}>\n${flag}${body}\n</page>`;
   }).join('\n\n');
+  return { text, truncated };
 }
 
 /** One line naming the typed links that put a chain row in the context (slugs and link types only). */
@@ -663,10 +689,11 @@ function graphEvidenceLine(p: SearchResult): string {
 
 export function takesHitToTakeForPrompt(h: TakeHit | Take): {
   page_slug: string; row_num: number; claim: string; kind: string;
-  holder: string; weight: number; source?: string | null; since_date?: string | null;
+  holder: string; weight: number; source?: string | null; since_date?: string | null; trust_tier?: TrustTier; origin?: string;
 } {
   // TakeHit + Take share the slug/claim/kind/holder/weight surface.
   const t = h as Take & TakeHit;
+  const lt = h as { trust_tier?: TrustTier; origin?: string };
   return {
     page_slug: t.page_slug,
     row_num: t.row_num,
@@ -676,5 +703,6 @@ export function takesHitToTakeForPrompt(h: TakeHit | Take): {
     weight: t.weight,
     source: 'source' in t ? (t as Take).source : null,
     since_date: 'since_date' in t ? (t as Take).since_date : null,
+    ...(lt.trust_tier ? { trust_tier: lt.trust_tier, origin: lt.origin } : {}),
   };
 }

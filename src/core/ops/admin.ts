@@ -1,4 +1,3 @@
-import { pageMutationSource, submitPageMutation } from '../persistence/page-mutations.ts';
 import { PAGE_MUTATION_PARAMS } from '../persistence/params.ts';
 import { readPolicyOpts } from './context.ts';
 import { attributeVersions, canReadWriteAttribution } from './attribution.ts';
@@ -78,9 +77,9 @@ const get_health: Operation = {
     // degrades the field, never the health call.
     let migrations: unknown;
     try {
-      const { migrationLedgerSummary } = await import('../migration-ledger.ts');
+      const { declinedMigrations, migrationLedgerSummary } = await import('../migration-ledger.ts');
       const { VERSION } = await import('../../version.ts');
-      migrations = migrationLedgerSummary(VERSION);
+      migrations = migrationLedgerSummary(VERSION, await declinedMigrations(ctx.engine));
     } catch {
       migrations = { error: 'ledger_unreadable' };
     }
@@ -234,6 +233,7 @@ const revert_version: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    const { pageMutationSource, submitPageMutation } = await import('../persistence/page-mutations.ts');
     pageMutationSource(ctx, p, 'revert_version');
     enforceClientSlugFence(ctx, p.slug as string, 'revert_version');
     if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };

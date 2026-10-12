@@ -55,6 +55,7 @@ import {
 } from '../core/sources-ops.ts';
 import { isValidRepoName } from '../core/github-source.ts';
 import { ALL_GOOGLE_SERVICES, DEFAULT_CALENDAR_ID } from '../core/google/types.ts';
+import { defaultGoogleAddTuning, parseGoogleAddFlag } from './sources-google-flags.ts';
 import {
   resolveSourceWithTier,
   SOURCE_TIER_NAMES,
@@ -71,6 +72,8 @@ import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { preflightOauthClientColumns } from './auth.ts';
 import { deleteSourceRow } from '../core/source-delete.ts';
 import { USAGE_EXIT_CODE } from '../core/exit-codes.ts';
+import { isSyncStrategy } from '../core/sync.ts';
+import { pullStrategyOf } from '../core/git-remote.ts';
 
 // ── Validation ──────────────────────────────────────────────
 
@@ -103,6 +106,8 @@ interface SourceListEntry {
   local_path: string | null;
   federated: boolean;
   mirror_read_only: boolean;
+  strategy: 'markdown' | 'code' | 'auto' | null;
+  pull_strategy: 'rebase' | 'merge';
   page_count: number;
   last_sync_at: string | null;
 }
@@ -143,7 +148,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         '[--repos owner/name,...] [--dir <path>] ' +
         '[--app-id <n> --app-pem <path>] [--app-install <n>]\n' +
         '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
-        '[--history-days <n>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
+        '[--history-days <n>] [--future-days <n>] [--loops-exclude-labels <a,b>] [--contacts-dir <dir>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
         '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)',
     );
     process.exit(2);
@@ -173,8 +178,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   let gTokenCommand: string | undefined;
   let gTokenEnv: string | undefined;
   let gServices: string[] = ['gmail', 'calendar', 'contacts'];
-  let gHistoryDays = 90;
-  let gCalendarId: string = DEFAULT_CALENDAR_ID;
+  const gTuning = defaultGoogleAddTuning();
 
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
@@ -218,24 +222,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         .filter(Boolean);
       continue;
     }
-    if (a === '--history-days') {
-      const v = Number(args[++i]);
-      if (!Number.isInteger(v) || v <= 0) {
-        console.error('--history-days must be a positive integer.');
-        process.exit(2);
-      }
-      gHistoryDays = v;
-      continue;
-    }
-    if (a === '--calendar-id') {
-      const v = (args[++i] ?? '').trim();
-      if (!v) {
-        console.error('--calendar-id needs a value (see: gbrain google calendars).');
-        process.exit(2);
-      }
-      gCalendarId = v;
-      continue;
-    }
+    if (parseGoogleAddFlag(a, args[i + 1], gTuning)) { i++; continue; }
     if (a === '--scope') {
       const scope = args[++i];
       if (scope !== 'auto' && scope !== 'repos') {
@@ -327,7 +314,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         // one calendar per source is how secondary calendars are ingested.
         const existingCal =
           typeof c.g_calendar_id === 'string' && c.g_calendar_id.trim() ? c.g_calendar_id.trim() : DEFAULT_CALENDAR_ID;
-        if (existingCal !== gCalendarId) overlap = overlap.filter((s) => s !== 'calendar');
+        if (existingCal !== gTuning.calendarId) overlap = overlap.filter((s) => s !== 'calendar');
         if (overlap.length === 0) return false;
         overlapNote = overlap.join(', ');
         return true;
@@ -432,8 +419,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
           google: {
             account: gAccount!,
             services: gServices,
-            historyDays: gHistoryDays,
-            calendarId: gCalendarId,
+            ...gTuning,
             dir: ghDir ?? defaultCloneDir(`${id}-google`),
             access: (gAccess ?? 'vault') as 'vault' | 'command' | 'env',
             tokenCommand: gTokenCommand,
@@ -631,6 +617,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
   }
 
   let dir = path;
+  let pullStrategy: 'rebase' | 'merge' = 'rebase';
   if (id) {
     const src = await fetchSource(engine, id);
     if (!src) {
@@ -642,6 +629,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
       process.exit(1);
     }
     dir = src.local_path;
+    pullStrategy = pullStrategyOf(parseConfig(src.config));
   }
 
   const { workspacePush, formatBlockedSecrets } = await import('../core/workspace-push.ts');
@@ -649,6 +637,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
   const res = await workspacePush({
     dir: dir!,
     branch,
+    pullStrategy,
     commitMessage: message,
     allowUnverifiedRemote: allowUnverified,
     logger: (l) => console.error(`[gbrain] ${l}`),
@@ -728,6 +717,8 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       local_path: r.local_path,
       federated: isFederated(r.config),
       mirror_read_only: parseConfig(r.config).mirror_read_only === true,
+      strategy: isSyncStrategy(parseConfig(r.config).strategy) ? parseConfig(r.config).strategy as 'markdown' | 'code' | 'auto' : null,
+      pull_strategy: pullStrategyOf(parseConfig(r.config)),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
     });
@@ -1250,6 +1241,9 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   const sharedSkills = new Map(await Promise.all(sources.map(async source => [source.id, await sharedSkillsView.readSharedSkillsSourceView(engine, source.id).catch(() => null)] as const)));
   const uncommittedView = await import('../core/fence-repair/uncommitted.ts');
   const uncommitted = await uncommittedView.uncommittedFenceRepairsBySource(engine, sources.map(source => source.id));
+  // #6317 (B4): whether managed sync data moves, beside sync_running (a live lock is not progress); the writer-status command rides along.
+  const movementView = await import('../core/persistence/sync-movement.ts');
+  const movement = new Map((await movementView.readSourceMovement(engine, { sourceIds: sources.map(source => source.id) }).catch(() => [])).map(m => [m.source_id, m]));
   if (json) {
     const enriched = metrics.map((m) => ({
       ...m,
@@ -1258,6 +1252,8 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
       ...(ingestion.get(m.source_id) ? { ingestion: ingestion.get(m.source_id) } : {}),
       ...(connectors.get(m.source_id) ? { connector: connectors.get(m.source_id) } : {}),
       ...(backlog.get(m.source_id) ? { managed_backlog: backlog.get(m.source_id) } : {}),
+      ...(movement.get(m.source_id) ? { data_moving: movement.get(m.source_id)!.data_moving, not_moving_since: movement.get(m.source_id)!.not_moving_since,
+        movement_state: movement.get(m.source_id)!.movement_state, movement: movement.get(m.source_id) } : {}),
       ...(gitHolds.get(m.source_id) ? { git_holds: gitHolds.get(m.source_id) } : {}),
       ...(sharedSkills.get(m.source_id) ? { shared_skills: sharedSkills.get(m.source_id) } : {}),
       ...(uncommitted.get(m.source_id) ? { fence_repairs_uncommitted: uncommitted.get(m.source_id) } : {}),
@@ -1301,6 +1297,7 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   for (const [sourceId, status] of connectors) for (const line of statusView.connectorStatusLines(sourceId, status)) console.log(line);
   for (const [sourceId, status] of gitHolds) for (const line of statusView.gitHoldStatusLines(sourceId, status)) console.log(line);
   for (const b of backlog.values()) console.log(`  ${drainMod.formatManagedSyncBacklog(b)}`);
+  for (const m of movement.values()) { const line = movementView.formatSourceMovement(m); if (line) console.log(`  ${line}`); }
   for (const [sourceId, notices] of uncommitted) for (const line of uncommittedView.uncommittedFenceRepairLines(sourceId, notices)) console.log(line);
   for (const view of sharedSkills.values()) if (view && (only || view.configured === false || view.parked)) for (const line of sharedSkillsView.sharedSkillsStatusLines(view)) console.log(`  ${line}`);
   for (const m of metrics) {
@@ -1891,6 +1888,8 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'federate':   return runFederate(engine, rest, true);
     case 'unfederate': return runFederate(engine, rest, false);
     case 'mirror-readonly': case 'mirror-writable': return (await import('./sources-mirror.ts')).runMirrorMode(engine, rest, sub === 'mirror-readonly');
+    case 'set-strategy': return (await import('./sources-strategy.ts')).runSetStrategy(engine, rest);
+    case 'set-pull-strategy': return (await import('./sources-pull-strategy.ts')).runSetPullStrategy(engine, rest);
     case 'refresh':    return (await import('./sources-refresh.ts')).runSourcesRefresh(engine, rest);
     case 'archive':    return runArchive(engine, rest);
     case 'restore':    return runRestore(engine, rest);
@@ -1908,6 +1907,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'tracked-branch': return runTrackedBranch(engine, rest);
     // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);
+    case 'set-trust':  { const { runSetTrust } = await import('./sources-trust.ts'); return runSetTrust(engine, rest); }
     // #4739 non-destructive local_path pointer repair
     case 'set-path':   { const { runSetPath } = await import('./sources-set-path.ts'); return runSetPath(engine, rest); }
     case 'shared-skills': { const { runSourcesSharedSkills } = await import('./sources-shared-skills.ts'); return runSourcesSharedSkills(engine, rest); }
@@ -1943,7 +1943,7 @@ Subcommands:
                                     Register a new source. --path must be a git repo
                                     with committed files; --force skips that check.
   list [--json]                     List registered sources with page counts.
-  writer status|claim|activate|transfer  Inspect, activate or transfer canonical ownership (see writer --help).
+  writer status|movement|claim|activate|transfer  Inspect ownership, prove data moves, activate or transfer (see writer --help).
   reconcile <id> <slug> --brain <id> Preview or apply a guarded file/database repair (see reconcile --help).
   remove <id> [--confirm-destructive] [--dry-run]
                                     Permanently delete a source and all its data.
@@ -1982,6 +1982,8 @@ Subcommands:
   unfederate <id>                   Isolate source from default search.
   mirror-readonly <id>              Read-only mirror (#5409): managed writes never touch its checkout.
   mirror-writable <id>              Undo mirror-readonly.
+  set-strategy <id> <markdown|code|auto>  Persist the sync strategy every sync of the source uses (PR #5955).
+  set-pull-strategy <id> <rebase|merge>   How pulls reconcile local commits with origin (#5429); default rebase.
   refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--resume|--abandon] [--json]
                                     Managed brains: drain writes to the source's worktree, fast-forward
                                     it to its upstream (git merge --ff-only) and sync every source bound
@@ -1991,6 +1993,7 @@ Subcommands:
                                     override (v0.40.3.0). Pass "unset" or
                                     "default" to clear (NULL falls through
                                     to the global search.mode bundle).
+  set-trust <id> <tier>|--clear     Trust default for this source's sync and import (operator_curated or lower).
   set-path <id> <path> [--force]    Repair a source's local_path pointer
                                     (DB column only, never touches disk).
                                     --force skips the overlapping-path guard.

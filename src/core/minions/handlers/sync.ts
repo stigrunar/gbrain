@@ -34,6 +34,23 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
         // global config.sync.* anchor in performSync.
       }
     }
+    // #4399: a queued automatic freshness sync re-reads the source when it runs, so a source
+    // disabled after enqueue is not synced. Explicit jobs still run; a failed lookup falls through.
+    if (job.data.embed_reason === 'autopilot_freshness') {
+      const id = sourceId ?? 'default';
+      const { isSyncDisabledConfig } = await import('../../sync-policy.ts');
+      let disabled = false;
+      try {
+        const [row] = await engine.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id = $1', [id]);
+        disabled = row !== undefined && isSyncDisabledConfig(row.config);
+      } catch {
+        disabled = false;
+      }
+      if (disabled) {
+        console.error(`[sync] skipped: source ${id} has syncEnabled:false; queued freshness sync not run.`);
+        return { skipped: true, reason: 'sync_disabled', source_id: id };
+      }
+    }
     // v0.22.13 (PR #490 CODEX-4): route concurrency through the shared
     // autoConcurrency helper instead of hardcoded 4. PGLite engines stay
     // serial (forced 1); explicit job param wins; auto path defaults are
@@ -85,6 +102,12 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
           `(lock ${err.lockKey} held).`,
         );
         return { skipped: true, reason: 'sync_in_progress', source_id: sourceId ?? 'default' };
+      }
+      // P4.2 (supersedes #6465): a job an older daemon queued for a gbrain-owned content directory completes as a
+      // skip instead of dying after its attempts; the dispatchers no longer queue one (automaticSyncSkip).
+      if ((err as { code?: unknown } | null)?.code === 'sync_not_applicable') {
+        console.error(`[sync] skipped: sync does not apply to ${sourceId ?? 'default'} (gbrain-owned content directory, not a Git checkout).`);
+        return { skipped: true, reason: 'sync_not_applicable', source_id: sourceId ?? 'default' };
       }
       throw err;
     }

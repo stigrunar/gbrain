@@ -45,7 +45,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn } from '../core/spawn.ts';
+import { gitChildEnv } from '../core/git-env.ts';
 import { ensureGbrainHome, resolveGbrainHome } from '../core/gbrain-home.ts';
 import { loadConfig, type GBrainConfig } from '../core/config.ts';
 import {
@@ -74,10 +75,13 @@ import {
   CORPUS_PROGRESS_LOCK_SUFFIX,
   HARVEST_RECEIPT_SUFFIX,
   segmentHash,
+  sessionCorpusFileName,
 } from '../core/context/corpus-segments.ts';
+import { openSessionCorpus } from '../core/context/corpus-source.ts';
 import { hookLaneLabel, resolveSeat, seatReasonHint, writeSeatSidecar } from '../core/context/seat.ts';
 import { gateWritebackTurn, WRITEBACK_SKIP_REASONS } from '../core/facts/writeback-gate.ts';
 import { resolveWritebackConfigFromFile } from '../core/facts/writeback-config.ts';
+import { recordCaptureIfOff } from '../core/context/capture-consent.ts';
 import { memorableGateAllowed, recordAndRelayReceipt, redactedToolCallsJson } from '../core/context/hook-heartbeat.ts';
 import { captureSpecFor } from '../core/transcripts/capture-spec.ts';
 import {
@@ -94,6 +98,7 @@ import { readManifest, readReceipt, type InstallReceipt } from '../core/bootstra
 import { githubOwnerRepoString } from '../core/repo-visibility.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
 import {
+  livePushStatuses,
   readPushStatuses,
   readPushStatusForRoot,
   sanitizePushReason,
@@ -112,6 +117,8 @@ import {
 import { realpathOrResolve } from '../core/path-confine.ts';
 import { isClaudeCliSelfTranscriptPath } from '../core/ai/providers/claude-cli-scratch.ts';
 import { withoutPhysicalRootMetadata } from '../core/persistence/root-metadata.ts';
+import { HOOK_SUBCOMMANDS as HOOK_EVENTS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+import { isManagedFilesystemPath } from '../core/persistence/filesystem-guard.ts';
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
@@ -232,7 +239,8 @@ export interface HookIo {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
-export const HOOK_EVENTS = ['session-start', 'user-prompt', 'stop', 'session-end', 'compact'] as const;
+export { HOOK_EVENTS, HOOK_EVENTS as SUBCOMMANDS };
+export const printUsage = (): void => { process.stdout.write(`${USAGE}\n`); };
 
 const USAGE = `Usage: gbrain hook <event>
 
@@ -257,7 +265,7 @@ All events fail open: errors exit 0 with empty stdout and a heartbeat entry at
 /** Dispatch a hook event. Returns the process exit code (0 for every runtime path). */
 export async function runHook(args: string[], io: HookIo = {}): Promise<number> {
   const event = args[0];
-  if (event === '--help' || event === '-h' || event === 'help') {
+  if (subcommandHelpRequested(args, ROUTERS.hook)) {
     write(io, USAGE + '\n');
     return 0;
   }
@@ -535,6 +543,7 @@ async function hookSessionStart(io: HookIo): Promise<number> {
       //    digest above must never be hostage to the brain being down.
       try {
         const cfg = loadConfig();
+        if (sanitizeSessionId(j?.session_id) !== 'unknown') await sessionCorpus(io, cfg, sanitizeSessionId(j?.session_id), ws); // #6268: freeze at start
         // Engine-uniform (#4245): same config-keyed socket/secret resolution
         // as the user-prompt and compact arms (PGLite data dir; Postgres
         // hash12(database_url) run-dir). Null → silent skip, as before.
@@ -650,7 +659,8 @@ async function pushStatusNote(): Promise<string | null> {
   try {
     // One reader + one aggregation for every status surface [D8]; per-root
     // files [D13] so one workspace's success can't mask another's failure.
-    const entries = readPushStatuses();
+    // #5799: a managed root's records are the fenced legacy push, not this note's subject.
+    const entries = livePushStatuses(readPushStatuses());
     if (entries.length === 0) return null;
     const { failing, stalestTs } = summarizePushStatuses(entries);
     if (failing.length > 0) {
@@ -714,7 +724,7 @@ function tryExecAsync(bin: string, args: string[], timeoutMs = HOOK_GIT_TIMEOUT_
       execFile(
         bin,
         args,
-        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: process.env },
+        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: gitChildEnv() },
         (err, stdout) => resolve(err ? null : stdout.toString().trim()),
       );
     } catch {
@@ -817,6 +827,7 @@ async function dirtyTreePush(
     const root = await resolveBootstrapWorkspaceRoot(ws);
     if (!root) return null;
     if (!(await treeNeedsPush(root))) return null; // clean + up to date → nothing to recover
+    if (isManagedFilesystemPath(root)) return { reason: 'push_managed_coordinator' };
     // There IS unpushed work. Defer until the repo phase verified privacy +
     // recorded repo_url — never recover-push to an unverified origin
     // (create-repo-first race). Only fires when work actually exists (P2-1).
@@ -943,6 +954,7 @@ async function stopPushIfDue(ws: string, io: HookIo): Promise<string> {
   // verified the origin and recorded repo_url (create-repo-first race).
   if (!(await repoPhaseComplete(root))) return 'push_deferred_repo_pending';
   if (!(await treeNeedsPush(root))) return 'push_clean';
+  if (isManagedFilesystemPath(root)) return 'push_managed_coordinator';
   try {
     // Written BEFORE the spawn so repeated fail-fast children stay debounced
     // on the healthy path; the [D20] failing-status bypass handles retries.
@@ -978,7 +990,8 @@ interface PushAnnounceState {
  */
 function pendingPushFailureBanner(): { text: string; record: () => void } | null {
   try {
-    const failing = readPushStatuses().filter((e) => e.ok === false);
+    // #5799: a refusal recorded on a managed root is not a failing push; the outbox publishes there.
+    const failing = livePushStatuses(readPushStatuses()).filter((e) => e.ok === false);
     if (failing.length === 0) return null;
     const now = Date.now();
     const due = failing.filter((e) => {
@@ -1365,12 +1378,14 @@ async function hookCompact(io: HookIo): Promise<number> {
     // any IPC. Written for EVERY engine config (the sweep backstop harvests it
     // when serve/IPC is unavailable). Per-step deadline degrades — a scan that
     // can't finish skips the segment ENTIRELY (never write unscanned content).
-    const dir = await corpusDir(cfg);
+    const { dir, stamp, source } = await sessionCorpus(io, cfg, sessionId, io.cwd ?? (typeof j.cwd === 'string' ? j.cwd : process.cwd()));
     seatReasons = captureSeat(io, dir, sessionId, transcriptPath);
     const banked = await bankCompactSegment(dir, sessionId, allTurns, boundaryTurnIndexes, {
       remainingMs: remaining,
       minScanMs: SEGMENT_MIN_BUDGET_MS,
       minWriteMs: SEGMENT_WRITE_MIN_BUDGET_MS,
+      beforeWrite: (file, text) => { recordCaptureIfOff(cfg, file, text, source); },
+      stamp,
     });
     segment = banked.segment;
     const flushCorpusFile = banked.flushCorpusFile;
@@ -1380,7 +1395,7 @@ async function hookCompact(io: HookIo): Promise<number> {
     // leftover database_path must not probe the PGLite socket (the resolver
     // checks engine first); a Postgres brain probes its hash12(database_url)
     // run-dir socket instead. Null = no keying material → degrade.
-    const compactSocket = await hookResolveSocketForConfig(cfg, process.env.GBRAIN_SOURCE);
+    const compactSocket = await hookResolveSocketForConfig(cfg, source);
     if (!compactSocket) { outcome = 'degraded'; reason = 'no_pglite_path'; return; }
     const secret = readIpcSecretForConfig(cfg);
     if (!secret) { outcome = 'degraded'; reason = 'no_serve'; return; }
@@ -1393,7 +1408,7 @@ async function hookCompact(io: HookIo): Promise<number> {
       bankOnly: true,
       trigger: 'compact-bank',
       ...(flushCorpusFile ? { flushCorpusFile } : {}),
-      ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+      ...(source ? { sourceId: source } : {}),
     });
     if (res === IPC_UNAVAILABLE) { outcome = 'degraded'; reason = 'ipc_unavailable'; return; }
     if ('degraded' in res && res.degraded === 'stale_serve') { outcome = 'degraded'; reason = 'stale_serve'; return; }
@@ -1506,21 +1521,17 @@ async function hookStop(io: HookIo): Promise<number> {
       if (!lastUser || !lastUser.text) return 'no_user_turn';
       const gated = gateWritebackTurn(lastUser.text);
       if (!gated.ok) return gated.reason;
-      const dir = await corpusDir(cfg);
+      const { dir, stamp, source } = await sessionCorpus(io, cfg, sid, ws);
       captureSeat(io, dir, sid, conf.path); // #4618: the seat precedes the banked turn file
-      const banked = await bankWritebackTurn(
-        dir, sid, gated.normalized, gated.hash24,
-        // Bank the session's source IN THE NAME so the sweep fallback files
-        // the turn into the same source the IPC lane below would have.
-        process.env.GBRAIN_SOURCE ?? null,
-      );
+      // The session's source rides IN THE NAME so the sweep fallback files the turn where the IPC lane below would.
+      const banked = await bankWritebackTurn(dir, sid, gated.normalized, gated.hash24, stamp);
       if (banked.status !== 'wb_banked' && banked.status !== 'wb_dup') return banked.status;
       if (banked.status === 'wb_dup') return 'wb_dup';
       // Prompt-harvest ask over the compact-bank IPC lane — sourceId rides
       // exactly like the compact call (OV2-9/OV-A6); every failure below is
       // degraded-not-blocking: the banked file is the durable artifact and
       // the sweep extracts it when serve is away.
-      const socket = await hookResolveSocketForConfig(cfg, process.env.GBRAIN_SOURCE);
+      const socket = await hookResolveSocketForConfig(cfg, source);
       if (!socket) return 'no_pglite_path';
       const secret = readIpcSecretForConfig(cfg);
       if (!secret) return 'no_serve';
@@ -1530,7 +1541,7 @@ async function hookStop(io: HookIo): Promise<number> {
         bankOnly: true,
         trigger: 'writeback-bank',
         ...(banked.flushCorpusFile ? { flushCorpusFile: banked.flushCorpusFile } : {}),
-        ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+        ...(source ? { sourceId: source } : {}),
       });
       if (res === IPC_UNAVAILABLE) return 'ipc_unavailable';
       if ('degraded' in res && res.degraded === 'stale_serve') return 'stale_serve';
@@ -1616,6 +1627,10 @@ async function corpusDir(cfg: GBrainConfig | null): Promise<string> {
   ensureDir0700(join(home, 'transcripts'));
   return ensureDir0700(join(home, 'transcripts', 'corpus'));
 }
+
+/** #6268: the session's spool dir and frozen source stamp (`source` unset while unresolved). */
+const sessionCorpus = async (io: HookIo, cfg: GBrainConfig | null, sessionId: string, cwd: string) =>
+  openSessionCorpus(await corpusDir(cfg), sessionId, { cwd, harness: io.harness ?? 'claude-code' });
 
 function corpusRetentionDays(cfg: GBrainConfig | null): number {
   // Key is plan-defined [G15] but not yet in the GBrainConfig type (config.ts
@@ -1718,7 +1733,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
       }
       turnsN = parsed.turns.length;
       bytesN = parsed.bytesRead;
-      if (bytesN > 0 && turnsN === 0) {
+      if (bytesN > 0 && turnsN === 0 && parsed.recognizedOnly) {
+        reason = 'empty_session'; // opened and closed with no prompt: nothing to bank, not drift
+      } else if (bytesN > 0 && turnsN === 0) {
         // [G3] LOUD: the host format drifted under us — heartbeat error +
         // status file surfaced at the next session-start.
         outcome = 'error';
@@ -1740,7 +1757,7 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
         // Whole-file reads only: a bounded tail of a long agentic run can
         // legitimately hold assistant turns alone.
         if (parsed.genuineUserTurnIndexes.length === 0 && bytesN >= conf.size) degrade('no_user_turns');
-        const dir = await corpusDir(cfg);
+        const { root, dir, stamp, source } = await sessionCorpus(io, cfg, sessionId, ws ?? process.cwd());
         // #4618: the seat is recorded BEFORE any corpus file of this session
         // is renamed into place, so a sweep never sees one without its seat.
         deferredReasons.push(...captureSeat(io, dir, sessionId, conf.path));
@@ -1784,8 +1801,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           // the rename so the sweep re-processes the appended transcript (a
           // resumed session's new turns were being permanently skipped when the
           // completion sidecar survived the overwrite).
-          const corpusFile = join(dir, `${sessionId}.txt`);
+          const corpusFile = join(dir, sessionCorpusFileName(sessionId, stamp));
           const tmpCorpus = `${corpusFile}.tmp-${process.pid}`;
+          recordCaptureIfOff(cfg, corpusFile, text, source); // #6091, before the rename
           writeFileSync(tmpCorpus, text, { mode: 0o600 });
           renameSync(tmpCorpus, corpusFile);
           // Additive signal for a local third-party consumer (never gbrain
@@ -1831,14 +1849,10 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           }
         }
         const retentionMs = corpusRetentionDays(cfg) * 24 * 60 * 60 * 1000;
-        gcCorpusTurnFiles(dir, retentionMs); // [G15]; un-ingested turns kept longer (E-N1)
-        gcCorpusArtifacts(dir, retentionMs, [
-          CORPUS_INGESTED_SUFFIX,
-          CORPUS_CLAIM_SUFFIX,
-          CORPUS_PROGRESS_SUFFIX,
-          CORPUS_PROGRESS_LOCK_SUFFIX,
-          HARVEST_RECEIPT_SUFFIX,
-        ]);
+        for (const gcDir of [dir, root]) { // the spool and the legacy top level
+          gcCorpusTurnFiles(gcDir, retentionMs); // [G15]; un-ingested turns kept longer (E-N1)
+          gcCorpusArtifacts(gcDir, retentionMs, [CORPUS_INGESTED_SUFFIX, CORPUS_CLAIM_SUFFIX, CORPUS_PROGRESS_SUFFIX, CORPUS_PROGRESS_LOCK_SUFFIX, HARVEST_RECEIPT_SUFFIX]);
+        }
       }
     }
   } catch (e) {
@@ -1855,7 +1869,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
   try {
     if (ws) {
       const root = await resolveBootstrapWorkspaceRoot(ws);
-      if (root && (await repoPhaseComplete(root))) {
+      if (root && isManagedFilesystemPath(root)) {
+        if (outcome === 'ok' && !reason) reason = 'push_managed_coordinator';
+      } else if (root && (await repoPhaseComplete(root))) {
         try {
           (io.spawnPush ?? spawnDetachedPush)(root);
           if (outcome === 'ok' && !reason) reason = 'push_spawned';

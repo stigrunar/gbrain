@@ -61,6 +61,9 @@ writer coordination refusal, inspect `gbrain sources writer status --brain <id>
 --json` on the selected host first and report the owner, epoch, enabled state and
 blocked recovery to the operator. Do not claim a checkout, activate managed mode,
 transfer an owner, replace identities, or remove ownership markers as a repair.
+When the status reads `enabled: false` and the refusal says `unbound_source`,
+the brain is in classic mode on purpose: report that writes go through the
+checkout (file, commit, `gbrain sync`) and leave it classic.
 Deliberate administration requires a separately approved topology change and the
 action-specific intent plus reviewed state precondition described in
 `docs/architecture/topologies.md`. Neither a TTY nor `--yes` nor
@@ -153,7 +156,11 @@ lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orpha
 `fence_repair` runs right after `sync`, once per maintenance pass: it repairs
 the facts and takes fences sync held or pages store malformed (the same plan
 `gbrain repair fences` previews), for at most 300 s or a third of the job's
-remaining time, and resumes on the next run. Pause it with
+remaining time, and resumes on the next run. `content_repair` runs right after
+it (#6377): the rest of the content-repair lane, today the `slug-conflicts`
+kind that removes a stray frontmatter `slug:` or records a recommended merge
+for a person (`gbrain repair content` previews both kinds), for at most 120 s
+or a third of the remaining time. Pause both with
 `gbrain config set fences.repair.enabled false`.
 
 The two new phases consolidate yesterday's conversations into long-term memory:
@@ -283,6 +290,9 @@ gbrain dream --json                                   # CycleReport JSON
 `git add` / `commit` / `push`. Either commit yourself or let `gbrain autopilot`
 handle it.
 Parses `- **YYYY-MM-DD** | Source — Summary` and `### YYYY-MM-DD — Title` formats.
+The `Source — Summary` dash may be an em dash, an en dash or a spaced hyphen (` - `);
+a colon (`Source: Summary`) is prose, so the row keeps `source: markdown` and the
+whole text as its summary.
 Note: extracted entries improve structured queries (`gbrain timeline`), not vector search.
 
 ### Autopilot check
@@ -392,10 +402,19 @@ Run weekly alongside lint. Surfaces missing embeddings, unused integrations,
 and configuration improvements.
 
 ### Embedding freshness
-Chunks without embeddings, or chunks embedded with an old model.
-- For large embedding refreshes (>1000 chunks), use nohup:
-  `nohup gbrain embed refresh > /tmp/gbrain-embed.log 2>&1 &`
-- Then check progress: `tail -1 /tmp/gbrain-embed.log`
+Chunks without an embedding yet (`--stale` selects exactly those). Embedding
+calls the configured provider, which bills per token, so this is paid work
+that needs the user's approval first:
+1. Preview with no provider calls: `gbrain embed --stale --dry-run`.
+2. Relay the chunk count and cost estimate to the user and wait for an answer.
+3. Only after they agree, run `gbrain embed --stale --yes --max-usd <cap>`
+   with the cap they approved.
+
+Without approval the command stops with exit 3 and an `[AGENT]` block asking
+you to ask the user; relay it and stop. Never pass `--yes` on your own.
+For a long run (>1000 chunks), route the approved command through the
+durable ladder in `skills/minion-orchestrator/SKILL.md` instead of a bare
+background shell, which hides that exit 3 in a log file.
 
 ### Security (RLS verification)
 Run `gbrain doctor --json` and check the RLS status.
@@ -450,11 +469,18 @@ staleness.
 
 ### Weekly maintenance
 
-Run `gbrain embed --stale` to refresh embeddings for pages that have changed since
-their last embedding. For large brains (>5000 pages), run this with nohup:
+Refresh embeddings for chunks that have none yet, with the same consent steps
+as "Embedding freshness" above: `gbrain embed --stale --dry-run`, relay the
+estimate, and after the user agrees `gbrain embed --stale --yes --max-usd <cap>`
+(or a standing approval the user set with
+`consent.preapprove.paid.max_usd_per_run`). For large brains (>5000 pages),
+submit the approved command through the minion-orchestrator durable ladder;
+if you must background it in a shell, keep the exit code:
 ```bash
-nohup gbrain embed --stale > /tmp/gbrain-embed.log 2>&1 &
+(gbrain embed --stale --yes --max-usd <cap>; echo "exit=$?") > /tmp/gbrain-embed.log 2>&1 &
+tail -2 /tmp/gbrain-embed.log   # later: the last line is exit=<code>
 ```
+Exit 3 in that log means the run needs the user's approval: relay it and stop.
 
 ### Monthly backup check
 
@@ -494,7 +520,7 @@ This creates an audit trail for brain health over time.
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `gbrain doctor --remediate` steps marked "requires user agreement" (PROTECTED repairs, paid steps): show the plan and cost, and run with `--yes --include-repairs --expect <plan_hash> --max-usd <n>` (the hash from `--remediation-plan --json`) only after the user agrees; `preview_changed` means the plan moved, so preview and ask again. A step that would exceed the cap is not started.
 - A finding classified `operator_required`: follow its instruction or relay it to the brain host's operator. `consent_required`: ask the user.

@@ -50,11 +50,13 @@ import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } f
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
-import { upsertExtractRollup, classifyRunStop } from '../extract/rollup-writer.ts';
+import { upsertExtractRollup, classifyRunStop, providerHaltReason } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
 import { isConfigTruthy } from '../config.ts';
 import { matchingCloseBracket } from '../llm-json.ts';
 import { TAKE_KIND_VALUES } from '../takes-fence.ts';
+import { attributionChecksEnabled } from './attribution-checks.ts';
+import { downgradeAssistantOnlyHolders } from './propose-takes-attribution.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
@@ -292,10 +294,17 @@ async function listCandidatePages(
   engine: BrainEngine,
   scope: ScopedReadOpts,
   limit: number,
+  types: string[] | null = null,
 ): Promise<ProposeTakesPageRow[]> {
   const where = [
     'deleted_at IS NULL',
     "type IS DISTINCT FROM 'extract_receipt'",
+    // #5211: an atom is a fragment of a page that is itself a candidate; a legacy atom carries no writer stamp.
+    "type IS DISTINCT FROM 'atom'",
+    // #5212: never propose takes from the dream cycle's own output.
+    "COALESCE(frontmatter->>'dream_generated', '') <> 'true'",
+    "COALESCE(frontmatter->>'extracted_by', '') NOT LIKE 'extract_atoms%'",
+    "COALESCE(frontmatter->>'synthesized_by', '') NOT LIKE 'synthesize_concepts%'",
   ];
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
@@ -304,6 +313,11 @@ async function listCandidatePages(
   } else if (scope.sourceId) {
     params.push(scope.sourceId);
     where.push(`source_id = $${params.length}`);
+  }
+  // #5213: `cycle.propose_takes.types` narrows candidates to listed page types.
+  if (types) {
+    params.push(types);
+    where.push(`type = ANY($${params.length}::text[])`);
   }
   params.push(limit);
   return engine.executeRaw<ProposeTakesPageRow>(
@@ -314,6 +328,30 @@ async function listCandidatePages(
       LIMIT $${params.length}`,
     params,
   );
+}
+
+export const PROPOSE_TAKES_TYPES_KEY = 'cycle.propose_takes.types';
+
+/**
+ * #5213: the page types propose_takes may scan, from `cycle.propose_takes.types`
+ * (a JSON array of type names, the `cycle.enrich_thin.types` shape). Unset,
+ * empty, unreadable or malformed means every type stays a candidate; a
+ * malformed value also prints one stderr line so a typo is visible.
+ */
+export async function proposeTakesTypes(engine: BrainEngine): Promise<string[] | null> {
+  const raw = await engine.getConfig?.(PROPOSE_TAKES_TYPES_KEY).catch(() => null) ?? null;
+  if (raw == null || raw.trim() === '') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      const types = parsed.filter((t): t is string => typeof t === 'string' && t.trim().length > 0).map(t => t.trim());
+      if (types.length > 0) return types;
+    }
+  } catch {
+    // reported below
+  }
+  process.stderr.write(`[propose_takes] ignoring ${PROPOSE_TAKES_TYPES_KEY}: expected a JSON array of page types, e.g. gbrain config set ${PROPOSE_TAKES_TYPES_KEY} '["meeting","note"]'\n`);
+  return null;
 }
 
 /**
@@ -752,7 +790,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     const extractor = opts.extractor ?? defaultExtractor;
-    const { attributionRules, dateGrounding } = await takesPromptFlags(engine);
+    const [{ attributionRules, dateGrounding }, attributionChecks] = await Promise.all([takesPromptFlags(engine), attributionChecksEnabled(engine)]);
     const promptVersion = opts.promptVersion ?? `${PROPOSE_TAKES_PROMPT_VERSION}${attributionRules ? PROPOSE_TAKES_ATTRIBUTION_PROMPT_SUFFIX : ''}`;
     const pageLimit = opts.pageLimit ?? 100;
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
@@ -878,8 +916,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
       };
     }
 
-    // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pages = await listCandidatePages(engine, scope, pageLimit);
+    // Load pages eligible for proposal. Source-scoped per BaseCyclePhase; #5213 types narrow it.
+    const pages = await listCandidatePages(engine, scope, pageLimit, await proposeTakesTypes(engine));
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
@@ -996,6 +1034,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       }
       result.llm_calls_succeeded += 1;
       llmHalt.reset();
+      if (attributionChecks) proposals = downgradeAssistantOnlyHolders(proposals, body);
 
       // Write proposals to take_proposals. #2138: the idempotency key is
       // per-CLAIM — take_proposals_idempotency_idx folds md5(claim_text) into
@@ -1111,8 +1150,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
         budget_exhausted: result.budget_exhausted === true,
         deadline_hit: result.deadline_hit === true,
         error:
-          result.aborted_global_error !== undefined ||
-          result.aborted_failure_streak === true,
+          result.aborted_global_error !== undefined ? providerHaltReason(result.aborted_global_error) ?? 'item_error'
+            : result.aborted_failure_streak === true ? 'item_error' : false,
       }),
     });
 

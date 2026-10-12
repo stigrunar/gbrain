@@ -83,6 +83,15 @@ export function formatEnvOverrideWarning(w: EnvOverrideWarning): string {
   return lines.join('\n');
 }
 
+/** #4252: every index the cascade of DROP COLUMN `table`.embedding takes (pg_depend edges, partial WHERE predicates included). */
+async function embeddingDependentIndexes(tx: { executeRaw: <T = unknown>(sql: string, params?: unknown[]) => Promise<T[]> }, table: string) {
+  return tx.executeRaw<{ name: string; def: string }>(
+    `SELECT DISTINCT c.relname AS name, pg_get_indexdef(d.objid) AS def FROM pg_depend d JOIN pg_class c ON c.oid = d.objid AND c.relkind = 'i'
+      WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass AND d.deptype = 'a' AND d.refobjid = to_regclass($1)
+        AND d.refobjsubid = (SELECT attnum FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = 'embedding' AND NOT attisdropped)`, [table]);
+}
+const ifNotExists = (def: string) => def.replace(/^CREATE (UNIQUE )?INDEX /, 'CREATE $1INDEX IF NOT EXISTS ');
+
 /**
  * The atomic DROP + ALTER + CREATE INDEX sequence for content_chunks.
  * Both engines accept identical SQL (PGLite uses pgvector via WASM, same
@@ -121,19 +130,7 @@ export async function runSchemaTransition(engine: BrainEngine, targetDim: number
     // follows, so this also catches indexes that reference the column only
     // in a partial WHERE predicate (which a pg_indexes.indexdef text match
     // could not do without false-matching embedding_image/_multimodal).
-    const dependentIndexes = await tx.executeRaw<{ name: string; def: string }>(
-      `SELECT DISTINCT c.relname AS name, pg_get_indexdef(d.objid) AS def
-         FROM pg_depend d
-         JOIN pg_class c ON c.oid = d.objid AND c.relkind = 'i'
-        WHERE d.classid = 'pg_class'::regclass
-          AND d.refclassid = 'pg_class'::regclass
-          AND d.deptype = 'a'
-          AND d.refobjid = to_regclass('content_chunks')
-          AND d.refobjsubid = (
-            SELECT attnum FROM pg_attribute
-             WHERE attrelid = to_regclass('content_chunks')
-               AND attname = 'embedding' AND NOT attisdropped)`,
-    );
+    const dependentIndexes = await embeddingDependentIndexes(tx, 'content_chunks');
 
     // Text embedding column — transition to target dim.
     await tx.executeRaw(`DROP INDEX IF EXISTS idx_chunks_embedding`);
@@ -149,9 +146,7 @@ export async function runSchemaTransition(engine: BrainEngine, targetDim: number
         if (hnswIndexExpected('vector', targetDim)) ann.push(...parseDeferredAnnIndexes([idx], DEFERRED_ANN_TABLES));
         continue;
       }
-      await tx.executeRaw(
-        idx.def.replace(/^CREATE (UNIQUE )?INDEX /, 'CREATE $1INDEX IF NOT EXISTS '),
-      );
+      await tx.executeRaw(ifNotExists(idx.def));
     }
 
     // Image/multimodal embedding column — rebuild index but preserve
@@ -202,8 +197,8 @@ export async function runSchemaTransition(engine: BrainEngine, targetDim: number
   // embedding_is_null), so this clear is belt-and-braces, DELIBERATELY outside
   // the DDL transaction: a ~1M-row UPDATE inside the ACCESS EXCLUSIVE window
   // would hold the exclusive lock through row churn (the pooler-contention
-  // class pace-mode exists for), and a crash mid-batch leaves only
-  // redundant-lie rows that nothing reads. Batched with an event-loop yield
+  // class pace-mode exists for). It also stamps embedding_pending_since (kept when already
+  // pending) for doctor's backlog age; a row a crash skipped has none. Batched with an event-loop yield
   // between batches (setTimeout(0), NOT setImmediate — Bun starves the timers
   // phase under a tight setImmediate loop) so lock heartbeats keep firing.
   try {
@@ -217,10 +212,10 @@ export async function runSchemaTransition(engine: BrainEngine, targetDim: number
       const res = await engine.executeRaw<{ n: number; max_id: number | null }>(
         `WITH b AS (
            SELECT id FROM content_chunks
-            WHERE id > $1 AND embedded_at IS NOT NULL
+            WHERE id > $1 AND (embedded_at IS NOT NULL OR embedding_pending_since IS NULL)
             ORDER BY id LIMIT 50000
          ),
-         u AS (UPDATE content_chunks c SET embedded_at = NULL FROM b WHERE c.id = b.id RETURNING b.id)
+         u AS (UPDATE content_chunks c SET embedded_at = NULL, embedding_pending_since = COALESCE(c.embedding_pending_since, now()) FROM b WHERE c.id = b.id RETURNING b.id)
          SELECT count(*)::int AS n, max(id)::int AS max_id FROM u`,
         [cursor],
       );
@@ -309,9 +304,13 @@ async function transitionDimPinnedColumn(
   const columnType: 'vector' | 'halfvec' = udt.toLowerCase() === 'halfvec' ? 'halfvec' : 'vector';
   const opclass = columnType === 'halfvec' ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
 
+  // #4252: the DROP COLUMN cascade also takes every btree/partial index that
+  // reads the column (facts' idx_facts_unembedded, v237); replayed after the rebuild.
+  const dependents = await embeddingDependentIndexes(tx, table);
   await tx.executeRaw(`DROP INDEX IF EXISTS ${indexName}`);
   await tx.executeRaw(`ALTER TABLE ${table} DROP COLUMN IF EXISTS embedding`);
   await tx.executeRaw(`ALTER TABLE ${table} ADD COLUMN embedding ${columnType}(${targetDim})`);
+  for (const idx of dependents) if (idx.name !== indexName && !/USING hnsw/i.test(idx.def)) await tx.executeRaw(ifNotExists(idx.def));
   // HNSW has a per-type dimension ceiling; above it pgvector refuses the
   // index and exact scans remain the (correct, slower) path. #5088: the index
   // is returned for the deferred build after the re-embed, not created here.

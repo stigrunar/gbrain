@@ -35,6 +35,7 @@
     "countStaleChunks#signature+sourceId": {
       "raw": 1
     },
+    "countStaleFrontmatterKeyPages#default": {},
     "countStalePagesForExtraction#attendance-blocked+sourceId": {},
     "countStalePagesForExtraction#attendance-exclude": {},
     "countStalePagesForExtraction#default": {},
@@ -64,6 +65,7 @@
     "findCandidateDuplicates#default": {},
     "findCandidateDuplicates#embedding": {},
     "findDuplicatePage#default": {},
+    "findDuplicatePages#default": {},
     "findOntologyConflicts#default": {},
     "findOntologyConflicts#sourceIds+excludePrivate": {},
     "findOrphanPages#default": {},
@@ -83,8 +85,10 @@
     "getCalibrationCurve#default": {},
     "getCalibrationCurve#sourceId": {},
     "getCalleesOf#bareFallback": {},
+    "getCalleesOf#chunkId": {},
     "getCalleesOf#default": {},
     "getCalleesOf#sourceId": {},
+    "getCallersOf#chunkId": {},
     "getCallersOf#default": {},
     "getCallersOf#sourceId": {},
     "getChunkWindows#default": {},
@@ -238,6 +242,7 @@
     "listStaleChunks#updated_desc+sourceId+cursor": {
       "raw": 1
     },
+    "listStaleFrontmatterKeyPages#default": {},
     "listStalePagesForExtraction#afterPageId+versionTs+sourceId": {},
     "listStalePagesForExtraction#default": {},
     "listStaleTakes#default": {},
@@ -274,6 +279,7 @@
     },
     "readPageSnapshot#default": {},
     "readPageSnapshot#sourceId": {},
+    "readPageSnapshotsBatch#default": {},
     "refreshPageBody#default": {},
     "removeLink#default": {},
     "removeLink#linkSource": {},
@@ -287,6 +293,10 @@
       "tx": 1
     },
     "replaceDerivedLinks#default": {
+      "raw": 12,
+      "tx": 1
+    },
+    "replaceDerivedLinksBatch#default": {
       "raw": 12,
       "tx": 1
     },
@@ -305,9 +315,11 @@
     "revertToVersion#default": {},
     "revertToVersion#sourceId": {},
     "searchKeyword#cjk": {
+      "raw": 2,
       "tx": 1
     },
     "searchKeyword#cjk+sourceIds+detailLow": {
+      "raw": 2,
       "tx": 1
     },
     "searchKeywordChunks#cjk": {
@@ -336,6 +348,7 @@
     "softDeletePage#default": {},
     "softDeletePage#sourceId": {},
     "softDeletePages#default": {},
+    "stripStaleFrontmatterKeys#default": {},
     "sumStaleChunkChars#default": {
       "raw": 1
     },

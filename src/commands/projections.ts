@@ -14,15 +14,14 @@ import type { OperationError } from '../core/ops/contract.ts';
 import { catalogueError } from '../core/error-catalogue.ts';
 import type { LockHolderInfo } from '../core/pglite-lock.ts';
 import type { ProgressReporter } from '../core/progress.ts';
-import {
-  projectionBacklog, rebuildPendingPageProjections, type ProjectionRebuildFailure,
-} from '../core/page-state/projections.ts';
+import { type ProjectionRebuildFailure } from '../core/page-state/projections.ts';
+// #6286: the drain lives in core so `migrate` can run it on its target before the config flip.
+export { drainProjections, type ProjectionDrainResult } from '../core/page-state/projections.ts';
 import { SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT } from '../core/serve-service.ts';
 import { resolveAutopilotJob } from '../core/autopilot-paths.ts';
 import { detectInstalledJob } from './autopilot/jobs.ts';
 
 export const PROJECTION_DRAIN_DOCS = 'docs/guides/repair.md#projection-drain';
-const BATCH = 100;
 
 export const PROJECTIONS_HELP = `Usage: gbrain projections drain [--limit <n>] [--json]
 
@@ -40,46 +39,6 @@ On Postgres the drain is safe while \`gbrain serve\` runs. Progress goes to stde
 Docs: ${PROJECTION_DRAIN_DOCS}
 `;
 
-export interface ProjectionDrainResult {
-  rebuilt: number;
-  superseded: number;
-  failed: ProjectionRebuildFailure[];
-  remaining: number;
-  limited: boolean;
-}
-
-export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter } = {}): Promise<ProjectionDrainResult> {
-  const [{ runStart }] = await engine.executeRaw<{ runStart: string }>('SELECT now()::text AS "runStart"');
-  // PGLite's clock can be coarse: wait until it passes the run start, so a page
-  // that fails in this run is stamped after it and is not tried again.
-  while (!(await engine.executeRaw<{ passed: boolean }>('SELECT now()>$1::text::timestamptz AS passed', [runStart]))[0]?.passed) {
-    await new Promise(resolve => setTimeout(resolve, 1));
-  }
-  const total = (await projectionBacklog(engine)).pending;
-  opts.progress?.start('projections.drain', opts.limit === undefined ? total : Math.min(total, opts.limit));
-  const failed: ProjectionRebuildFailure[] = [];
-  let rebuilt = 0;
-  let superseded = 0;
-  let tried = 0;
-  try {
-    while (opts.limit === undefined || tried < opts.limit) {
-      const failuresBefore = failed.length;
-      const batch = await rebuildPendingPageProjections(engine, Math.min(BATCH, (opts.limit ?? Infinity) - tried),
-        { notAfter: runStart, onFailure: failure => failed.push(failure) });
-      const attempted = batch.rebuilt + batch.superseded + failed.length - failuresBefore;
-      if (attempted === 0) break;
-      rebuilt += batch.rebuilt;
-      superseded += batch.superseded;
-      tried += attempted;
-      opts.progress?.tick(attempted, `${rebuilt} rebuilt, ${failed.length} failed`);
-    }
-  } finally {
-    opts.progress?.finish();
-  }
-  const remaining = (await projectionBacklog(engine)).pending;
-  return { rebuilt, superseded, failed, remaining, limited: opts.limit !== undefined && tried >= opts.limit && remaining > 0 };
-}
-
 /** The next step for one failed page, from the preparation error it reported. */
 export function projectionFailureNextAction(failure: ProjectionRebuildFailure): string {
   if (failure.reason.startsWith('Code projection requires a recorded source path')) {
@@ -87,6 +46,9 @@ export function projectionFailureNextAction(failure: ProjectionRebuildFailure): 
   }
   if (failure.reason.startsWith('This page kind requires its source importer')) {
     return `re-import it from its source: \`gbrain sync --source ${failure.source_id}\``;
+  }
+  if (failure.reason.startsWith('revision_conflict:')) {
+    return 'the page changed while it was being rebuilt; it stays queued at its new revision and `gbrain projections drain` rebuilds it on its next run';
   }
   return 'run `gbrain doctor`; the page stays queued and `gbrain projections drain` tries it again on its next run';
 }

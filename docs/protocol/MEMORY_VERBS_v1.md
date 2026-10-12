@@ -49,7 +49,7 @@ the same registry.
 
 ```bash
 gbrain init --pglite                                      # 2-second local brain
-claude mcp add gbrain -- "$(command -v gbrain)" serve --surface starter   # the verbs plus page tools
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface full   # every operation, the verbs included
 gbrain remember "gbrain install check" --provenance install-check
 gbrain recall --query "gbrain install check"              # …now ask your agent in a NEW session
 ```
@@ -64,28 +64,28 @@ If `claude` is not found: install Claude Code first, or use a block below.
 
 **Codex**
 ```bash
-codex mcp add gbrain -- "$(command -v gbrain)" serve --surface starter
+codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full
 ```
 
 **Grok Build** (verify with `grok mcp doctor gbrain` — the add is lazy)
 ```bash
-grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface starter
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface full
 ```
 
 **opencode** (verify with `opencode mcp list` — the add is lazy, and list SPAWNS the server)
 ```bash
-opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface starter
+opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface full
 ```
 
 **OpenClaw / any stdio MCP host** — register the server command
-`gbrain serve --surface starter`. Remote brains: `gbrain serve --http` on the
+`gbrain serve --surface full`. Remote brains: `gbrain serve --http` on the
 host, then `gbrain connect https://host/mcp --token gbrain_xxx --install` on
 each client.
 
 **Surface modes:** `--surface verbs` exposes EXACTLY the seven verbs —
 advertised list AND dispatch are filtered fail-closed (a hidden op returns
 `unknown_tool` even when called by name). `--surface starter` exposes the
-~27-op daily-driver set (`STARTER_OPS` in `src/mcp/surface.ts`): the seven
+40-op daily-driver set (`STARTER_OPS` in `src/mcp/surface.ts`): the seven
 verbs plus the daily brain-tool slice, the agent lane, `whoami`, `capture`, and the
 `request_tools` discovery meta-op (re-derivable from production usage via
 `scripts/derive-starter-ops.ts`). Monotonic by construction: verbs ⊆ starter ⊆ full
@@ -93,8 +93,9 @@ verbs plus the daily brain-tool slice, the agent lane, `whoami`, `capture`, and 
 verb semantics. `--surface full` (the default for a bare `serve`) exposes
 every operation, verbs included. Every stdio registration gbrain writes
 (`gbrain init`'s quickstart, readiness, `gbrain bootstrap hooks`, the plugins)
-pins `starter`, because `verbs` lacks the page reads and writes bootstrap's
-instructions use and `full` puts the whole catalogue in front of the model.
+pins `full`, callable and advertised: in the held-out agent benchmark, listing
+only `starter` or `verbs` lowered task success and saved no tokens. A harness
+that caps its tool count can register `--surface starter` or `--surface verbs`.
 Persist a default for bare `serve` with `gbrain config set mcp_surface verbs`.
 On stdio, `GBRAIN_SURFACE` in the server's env overrides `--surface`; a
 session widens itself with `request_tools {"surface":"full"}` (see
@@ -114,7 +115,7 @@ have no per-client row: they serve the server-resolved surface directly.
 
 ## The verbs
 
-### recall(query?, entity?, budget_tokens?, budget_policy?, source_id?, since?, session_id?, limit?, …) — read
+### recall(query?, question?, entity?, budget_tokens?, budget_policy?, source_id?, since?, session_id?, limit?, …) — read
 
 Retrieve saved facts and (with `query`) budget-packed page snippets.
 
@@ -127,6 +128,21 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
   composes with `entity` and `session_id` in the same query, before the
   per-arm limit. An unparseable value is rejected with `invalid_params`.
 - `limit` is a PER-ARM cap (facts and search results each).
+- `question`: optional string (at most 2,000 characters). The FACTS arm then
+  returns active facts ranked by relevance to the question instead of newest
+  first: cosine to the question's embedding plus whole-word term share, plus
+  0.1 when the fact carries a writer-supplied date. Facts below the admission
+  rule are not returned, so an empty `facts[]` is a valid answer. `entity`,
+  `session_id`, `since` and `grep` filter before ranking. `question` does not
+  search pages; `query` does, and both may be passed. `supersessions: true` or
+  `include_expired: true` with `question` is `invalid_params` (ranking covers
+  active facts only); the error's `fix.mcp` is the call without them. One query
+  embedding per call, no model call. Without an embedding provider, with
+  embeddings turned off, or when the embed fails, facts rank by term share and
+  `facts_degraded.reason` says why. A server without question ranking ignores
+  the parameter (or rejects it under `mcp.strict_params=reject`); clients detect
+  support by `facts_order: "relevance"` in the response or `question` in the
+  live tool schema, not by `protocol_version`.
 - `budget_tokens`: SERVER-side packing — by default facts pack first and search
   results take the remainder. A positive finite numeric budget is floored;
   other values leave the arrays unbudgeted. Costs are `ceil(fact.length/4)` or
@@ -165,10 +181,18 @@ Response — an additive SUPERSET of the plain facts envelope on EVERY call
 | `protocol_version` | int | always present (every verb, every call) |
 | `facts[]` | array | the base fact fields, PLUS per fact: `fact_id` (opaque STRING — the value `forget` accepts; the numeric `id` remains alongside it for compatibility) and `provenance` (the stored source attribution) |
 | `total` | int | count of facts returned |
-| `results[]` | array | search arm only: `slug`, `title`, `chunk`, `evidence`, `create_safety`, `provenance` (origin page slug) |
+| `results[]` | array | search arm only: `slug`, `title`, `chunk`, `evidence`, `create_safety`, `provenance` (origin page slug), `source_id` (additive since #4830: the source the hit came from; on a federated read each hit names its own source, and a hit that carries none is labeled only when the read's scope is a single source, never a blind `default`) |
 | `search_degraded` | string? | present when keyword-only fallback fired |
+| `facts_order` | string | `relevance` (question passed) or `newest` |
+| `facts[].relevance` | number? | question calls only: the ranking score (about 0 to 2.1); not a probability and not comparable across calls |
+| `facts_degraded` | object? | question calls only: `reason` (`keyword_only_no_embedding_provider`, `keyword_only_embedding_disabled`, `embed_timeout`, `embed_unavailable`, `no_query_terms`, `facts_embedding_column_missing`) and `unembedded` (facts in scope without a comparable embedding; the `facts_unembedded` notice carries the `gbrain embed --stale --facts` preview) |
 | `budget_tokens` / `budget_used` / `dropped_count` | int? | present for a positive finite numeric budget, including when its floor is zero |
 | `budget_packing` | object? | present only when a valid `budget_policy` is supplied; effective policy and per-arm accounting |
+
+A call that passes `query` without `question` and without `entity`,
+`session_id`, `since` or `supersessions` returns its facts newest first, as v1
+always has, and carries a `recall_hint` notice (kind `info`) whose `fix.mcp` is
+the same call with `question` set to the query.
 
 `budget_packing` contains `policy` (effective `facts_first | query_first`),
 `applied` (whether the requested budget policy applied), `reason`, and `facts` /
@@ -235,7 +259,7 @@ matched. **create_safety** (enum): `exists` (a page for this already exists)
 signal). The derivation of both is implementation-defined and may improve;
 the values are frozen.
 
-### remember(fact, provenance, ttl?, entity?, kind?, visibility?, request_id?) — write
+### remember(fact, provenance, ttl?, entity?, kind?, visibility?, valid_from?, request_id?) — write
 
 Save ONE fact with mandatory attribution.
 
@@ -244,6 +268,7 @@ Save ONE fact with mandatory attribution.
   Empty ⇒ `provenance_required` error with a fix.
 - `entity`: set whenever the fact is about a specific person/company/project —
   entity-scoped recall will not find unattributed facts.
+- `valid_from` (ISO 8601): when the fact became true. Omitted ⇒ write time.
 - `infer_entity` (additive, boolean, default `true`): when `entity` is omitted,
   the server may link the fact to the one entity page its text names exactly
   (zero LLM; a second competing name, a bare first name or an ambiguous match
@@ -273,14 +298,33 @@ near-duplicates may insert; dedup and supersession ride embedding similarity).
   supersedes the old ("X at acme-example" → "X left acme-example").
 - Omitted optional inputs echo as `null`, never absent.
 
+A claim that was forgotten is refused with `invalid_params` and the message
+prefix `fact_withdrawn`: remembering the same text again does not restore it,
+and a claim forgotten without an entity is withdrawn for every entity. To link
+a fact saved without an entity, do not forget it; remember it with `entity`
+and `replaces` set to its id.
+
+#### remember withdrawn refusal detail (additive)
+
+A `fact_withdrawn` refusal may carry `withdrawn: { at, subject, visibility }`:
+`at` is when the claim was forgotten (ISO 8601), `subject` the entity slug it
+was forgotten for or `all_entities` (forgotten without an entity), and
+`visibility` the forgotten fact's. When several withdrawals match, the one for
+the named entity wins over `all_entities`, then the newest. The same object
+rides the immediate refusal, the `items[]` error, the failed write receipt and
+`get_write_request`. It covers the exact normalized claim only, never a
+paraphrase, and its absence carries no meaning: the message prefix, code and
+suggestion are unchanged.
+
 #### remember replaces (additive)
 
-`replaces` (string): the `fact_id` of the fact this new fact replaces. It is a
-caller-directed replacement: it says the old fact is no longer the current one,
-not that the two texts mean the same. Zero model calls; the cosine rule does
+`replaces` (string): the `fact_id` this fact replaces, caller-directed: the
+old fact is no longer current (the texts need not mean the same). Zero model calls; the cosine rule does
 not apply. The target must be an active fact in the same source, with the same
 visibility (world only for remote callers, else `not_found`) and the same
-entity, on the same entity page. Refusals come back as `invalid_params` with a
+entity, on the same entity page. A target saved without an entity may be
+replaced by a fact with an entity: that links it (the unlinked fact is
+superseded, not forgotten, so the claim stays rememberable). Refusals come back as `invalid_params` with a
 code prefix and a `suggestion`: `target_withdrawn` (forgotten facts are not
 replaceable; remember without `replaces`), `target_superseded` (names the fact
 that replaced it), `target_expired`, `replaces_entity_mismatch`,
@@ -291,6 +335,25 @@ text equal to the target is `status: duplicate` and changes nothing. On success
 `replaced_by_caller` is `true`; the replaced fact is expired with
 `superseded_by` and its `## Facts` row is struck with `superseded by #N` in
 the same publication. Every `superseded` response carries `superseded_fact_id`.
+
+Remembering a claim with an entity (given or inferred) when the same claim is
+an active fact saved without an entity, in the same source and visibility,
+links that copy as if `replaces` named it: `status: superseded`,
+`superseded_fact_id` names the unlinked copy, `replaced_by_caller` is absent,
+and `status_text` says there is nothing to forget. When `replaces` would refuse
+(for example `replaces_cross_page`), the fact is saved as a new one instead.
+
+#### remember content_origin (additive)
+
+`content_origin` (string: `user_said`, `tool_output` or `inferred`): where the
+fact's text came from. `tool_output` (a web page, email, file or other tool's
+text) stores the fact as `external_untrusted`; `user_said` and `inferred` store
+it at the agent tier (`agent_written`), so `user_said` never confers owner
+authority. Any other value is `invalid_params` listing the accepted values.
+Optional, and safety never depends on it. Like `replaces`, it is advertised on
+the verbs and full surfaces but left out of the starter surface's schema (to
+keep that tool list inside its size budget); a starter client that passes it
+is still honored. `put_page` and `capture` take the same parameter.
 
 #### remember entity attribution fields (additive)
 
@@ -319,15 +382,16 @@ fact, so it goes on its item; passing both `fact` and `items`, or a top-level
 
 Every item is validated before any is written: one invalid item refuses the
 whole call with `items[<i>]` in the message. Each item is then saved as its own
-write with a child `request_id` derived from the call's `request_id` and the
-item index, so replaying the same `request_id` replays each child's outcome and
+write with a child `request_id` derived from the call's `request_id` (the
+string the caller sent, so a batch accepted by an older server replays to the
+same receipts) and the item index, so replaying the same `request_id` replays each child's outcome and
 writes nothing twice.
 
-Response: `{ protocol_version, request_id, items[], saved, failed, partial,
+Response: `{ protocol_version, request_id, client_request_id?, items[], saved, failed, partial,
 hints?, next? }`. Each `items[]` entry is a compact receipt `{ index,
-request_id, status, id?, entity_slug?, warnings?, valid_until?, state? }`
+request_id, status, id?, entity_slug?, superseded_fact_id?, warnings?, valid_until?, state? }`
 (`state` and `retry_after_ms` only when the write is not yet committed), or
-`{ index, request_id, status: "failed", error: { code, message } }`. Hints the
+`{ index, request_id, status: "failed", error: { code, message, suggestion? } }`. Hints the
 single-fact response would repeat per item appear once in `hints`. `partial: true` means some items saved and some failed; resend
 only the failed items, in a new call with a new `request_id`.
 
@@ -354,6 +418,21 @@ backlink_count, active_fact_count }`.
 - `summary` passes the same privacy fences as `get_page` (takes + private
   facts stripped); remote callers never see private facts in the card.
 
+#### entity names: several lookups in one call (additive)
+
+`names` (1 to 50 strings) replaces `name` to resolve a list of names, codes or
+aliases at once; passing both, none or more than 50 is `invalid_params`. Each
+name resolves exactly as `name` does (same precedence, private pages hidden
+from remote callers), duplicates once, in first-seen order.
+
+Response: `{ protocol_version, latency_ms, results[], found, missing }`. Each
+row is `{ name, found: true, slug, title, type, aka[], lead, siblings? }` or
+`{ name, found: false, suggestions? }` (up to 3 `{slug, title}`). `lead` is the
+page's opening prose, up to 200 characters (headings, table rows, private
+fences and secrets removed); `siblings` lists the identity siblings with their
+own `slug`, `title`, `type`, `aka` and `lead`. Rows carry no references, facts
+or open threads: call `entity` with `name` for the full card.
+
 #### entity references and coverage (additive)
 
 The `entity` verb adds three optional card fields (ambient callers,
@@ -378,6 +457,17 @@ The `entity` verb adds three optional card fields (ambient callers,
   block. Coverage means recognized names within the caller's source.
 - `open_threads` (best-effort in v1): active commitment-kind facts + timeline
   entries from the last 90 days, capped at 3.
+
+#### entity identity fields (additive)
+
+The `entity` verb also adds: `aka_sources[]` (`{ origin, slug }` per `aka`
+entry; `aka` is unchanged and never claims completeness); `identity_siblings`
+(`{ pages[{ slug, title, type, aka[] }], capped }`: same subject under another
+title prefix, shown, never merged; more than 3 is `capped` with an
+`identity_siblings_capped` notice); `identity_excerpt[]` (`{ slug, line }`,
+verbatim name-like lines from the remote-sanitized body, 600 characters per
+page and 1,200 per card, `identity_excerpt_omitted[]`); `alias_guidance`
+(`{ text, requires_surface? }`). `recent_facts[]` (`{ id, fact, kind, valid_from, entity_slug? }`, the 5 newest active saved facts, also those saved under an identity sibling or the bare subject slug, which carry that `entity_slug`); `active_fact_count` and `recall {entity}` cover the same slugs.
 
 #### entity open_threads loop backing (additive)
 
@@ -468,6 +558,36 @@ purpose, no dedicated status); a `max_tokens`-cut envelope parses as
 `output_truncated` (warning `LLM_OUTPUT_TRUNCATED`) so a too-small output
 budget is distinguishable from malformed model output.
 
+#### synthesize evidence budget and provenance (additive, #5461)
+
+The pages the model reads are excerpts, not whole pages. Each gathered page
+gets `min(ceiling, floor(total / pages_gathered))` characters, never fewer
+than 600, with `total` from `think.pages_budget_chars` (4 000-200 000,
+default 12 000) and `ceiling` from `think.excerpt_ceiling_chars`
+(600-200 000, default 2 400), both set with `gbrain config set` on the brain
+host (the verb surface stays frozen: no new parameter). The total is a SOFT
+bound: the 600-character floor wins, so 40 pages at the default read 24 000
+characters. Raising the total alone never delivers whole pages while the
+ceiling holds, and even with both raised the unit shown is the gathered
+chunk or compiled text, so full pages are not promised. A value outside its
+range is refused at set time; a stored bad value is ignored for the call,
+the default applies and `warnings` carries
+`THINK_BUDGET_CONFIG_IGNORED:<key>`. Conversation-type pages (meetings,
+chats, transcripts) travel through evidence delivery instead, under
+`think.return_unit` and its token budget; the character budget does not
+apply to them.
+
+Two optional response fields report what happened:
+
+- `evidence_truncated: boolean` — true when at least one gathered page
+  reached the model in part (an excerpt cut at either end, or a delivered
+  block cut to its window). False means every gathered unit was shown whole.
+- `citations: [{ slug, source_id, row_num }]` — `sources[]` with
+  provenance, same order and length: `source_id` is the source the cited
+  page was gathered from (the highest-ranked gathered page with that slug);
+  `null` when the model cited a slug outside the gather (the response also
+  warns `CITATION_NOT_IN_GATHER:<slug>`). `sources: string[]` is unchanged.
+
 #### Answer feedback fields (additive)
 
 `recall` (when its `query` arm searched pages on the hybrid path) and
@@ -485,6 +605,22 @@ already-expired fact returns `expired: false` (success); unknown id ⇒
 `not_found`. Facts are expired with an audit trail, never deleted.
 
 Response: `{ id, expired, reason, protocol_version }`.
+
+A fact saved without an entity withdraws its claim under every entity. When the
+same claim is active on entity-linked facts (same source and visibility),
+forgetting the unlinked fact is refused with `invalid_params`, message prefix
+`claim_linked:`, naming those facts, and nothing changes. The `suggestion`
+says to keep them, or to forget them first to withdraw the claim everywhere.
+A forget never withdraws an active fact the caller cannot read; when one
+would be reached, the refusal keeps the `claim_linked:` prefix and names no fact.
+
+#### forget and purge (additive note)
+
+`forget` keeps this contract: it expires, never deletes. Removing a claim's
+text from live stores is a separate owner-only operation, `purge_fact` (CLI:
+`gbrain forget <id> --purge` on the brain host), which is not a memory verb and
+is never callable over MCP; a remote call gets `trusted_local_only` with the
+command for the user. See [expire versus purge](../guides/memory-boundaries.md#purge).
 
 #### forget similar_active and semantic_review (additive)
 
@@ -506,7 +642,7 @@ empty list means no close match was found, not that every rewording is gone.
 #### Durable write receipts (additive)
 
 Write receipts distinguish accepted work from committed memory. Their public
-shape is `{request_id, state, retry_after_ms, revision?, outcome?, persistence?,
+shape is `{request_id, client_request_id?, state, retry_after_ms, revision?, outcome?, persistence?,
 compacted?, created_at?, updated_at?, diagnostic?}`. States are `queued`, `running`,
 `recovering`, `committed`, `conflict`, `failed`, and `cancelled`. Terminal
 receipts have `retry_after_ms: null`. `persistence.mode` distinguishes a
@@ -526,13 +662,26 @@ A pending write is a protocol `unavailable` error with a populated suggestion,
 `protocol_version: 1`, and optional `write_request` and `write_error` fields.
 It never returns a success `status` or `expired` value. `write_error` carries
 the detailed concurrency reason without changing the frozen protocol error
-enum. A committed receipt retains the original memory-verb success fields.
+enum. Its values branch three ways on revisions: `revision_required` (the page
+exists and the write named no `expected_revision`: read it and resend),
+`revision_conflict` (the named revision is stale: re-read and merge) and
+`revision_backfill_pending` (resume the revision backfill). A committed receipt
+retains the original memory-verb success fields.
 Compaction may remove diagnostics, but must preserve those frozen result fields.
 
-The optional caller-generated UUID `request_id` identifies one write intent.
-Retry the same verb with the original arguments and the same ID to recover
-its outcome, including on the verbs-only surface. A terminal request is never
-executed again. Corrected input requires a new ID. Clients that lose a response
+The optional caller-chosen `request_id` identifies one write intent; reuse it
+only to retry the same write. Any id of 1 to 128 printable ASCII characters
+(0x21 to 0x7E, no spaces) is accepted. A UUID is used as is (lowercased); any
+other id maps to a deterministic UUIDv5 under one fixed gbrain namespace, so
+`request_id` in every response stays a UUID and the id the caller sent comes
+back as `client_request_id`, which is kept for the life of the receipt. The
+receipt helpers find a write by either id. Retry the same verb with the original
+arguments and the same ID to recover its outcome, including on the verbs-only
+surface. A terminal request is never executed again. Corrected input requires a
+new ID: reusing an id for a different write is refused with
+`idempotency_conflict` ("this request_id was used for a different write; send a
+new one or omit it"), which `remember` reports as `invalid_params` with
+`write_error: "idempotency_conflict"`. Clients that lose a response
 without retaining its request ID cannot assume that retrying content is an
 exactly-once write. A receipt never contains queued content, recovery paths or
 execution credentials.
@@ -620,6 +769,7 @@ Refusals name the edit and never include protected text:
 | `edit_protected_span` | `edit_index=<i>` | The text touches a takes or facts section; use the scoped operations. |
 | `edit_invalid` | `edit_index=<i>` when one edit is malformed | Pass 1 to 50 `{old_text, new_text}` objects with non-empty `old_text`. |
 | `revision_conflict` | `current_revision=<uuid>` | Read the page again, rebuild the edits, resend. |
+| `revision_required` | — | The page exists and the call named no `expected_revision` (`put_page`; additive since #5385, formerly reported as `revision_conflict`). Read the page, then resend with its revision, or `force: true` for an intentional overwrite. |
 
 ```json
 → get_page {"slug": "projects/example", "include_content": true}
@@ -639,25 +789,27 @@ From the CLI: `gbrain call edit_page '{"slug":"projects/example","expected_revis
 
 One deterministic, budget-packed bundle for a set of standing
 entities — entity cards + open threads + hot facts. Built for **session
-boundaries**: call it at session start to warm cold context, and immediately
-after compaction to rehydrate what the summary dropped. Composes existing arms
-(`entity` card builder + the hot-facts arm); never calls an LLM.
+boundaries**: call it at session start and right after compaction. Never
+calls an LLM.
 
 `entities` is comma-separated, capped at 8 (the response echoes the capped list). `budget_tokens` packs
-server-side (cards first, then facts; each item costs its rendered line and the
-envelope + section headers are reserved first, so `text` fits the budget) and the
-response reports `budget_used` (the token estimate of `text`) + `dropped_count`
-— it never trims client-side. `since` filters
+server-side (cards first, then facts; each item costs its rendered line after the
+envelope and headers are reserved, so `text` fits) and reports `budget_used`
+(tokens of `text`) + `dropped_count`. `since` filters
 open-thread events to those after the cursor. **Visibility is WORLD-ONLY by
-default** on every arm (a pack is injected into an agent context window that may
-be logged or synced to a cloud model). `include_private` widens ALL arms in
+default** on every arm (a pack lands in a context window that may be logged or
+synced to a cloud model). `include_private` widens ALL arms in
 lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
-degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core? }`. `text` is the
-pre-rendered, envelope-wrapped injectable block; with `budget_tokens` it is
-rendered from the packed sets and never exceeds the declared budget.
+degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld? }`. `text` is the
+envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
+
+`entities` scopes cards and threads, not the hot facts (the session's recent
+memory), so other facts can appear; `recall` with `entity` reads one entity
+strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
+and `provenance` (the stored source), never rendered into `text`.
 
 #### context_pack core memory (additive)
 
@@ -748,7 +900,7 @@ Published so harness authors place calls by cost, not by learning at timeout:
 | `entity` | zero-LLM, **p99 < 100ms** | CI-gated on a 20K-page corpus (below). Safe per entity-bearing message. |
 | `context_pack` | zero-LLM, sub-second | Fan-out capped at 8 entities. Session boundaries, not per-message. Push path passes a wall-clock deadline and returns a PARTIAL pack (`degraded_reason`) rather than overrun. |
 | `delta` | zero-LLM, sub-second | O(changes). Heartbeats — pull path only (there is no push heartbeat); session cursors expire after 7 idle days. |
-| `recall` | zero-LLM (keyword) to one embedding call (when `query` is passed) | Sub-second typical; the `query` arm adds one embedding round-trip. |
+| `recall` | zero-LLM (keyword) to one embedding call (when `query` or `question` is passed; a `query` and a `question` with the same text share one) | Sub-second typical; the `query` arm adds one embedding round-trip. |
 | `remember` / `forget` | write, sub-second | One durable write; `remember` adds one embedding call for dedup when a provider is configured. |
 | `synthesize` | **EXPENSIVE / SLOW** | LLM calls, seconds-to-minutes, costs money. Never place on a hot or ambient path. |
 
@@ -778,7 +930,7 @@ isolation on every read. Remote callers see `visibility = world` facts only.
 Read verbs redact credential-shaped values in their responses with the
 canonical secret scanner: a value becomes `<REDACTED:pattern>`. `recall`,
 `context_pack` and `delta` redact the facts' `fact`, `context` and `source`
-fields for remote callers (`ctx.remote !== false`; every MCP transport,
+(`provenance`) fields for remote callers (`ctx.remote !== false`; every MCP transport,
 including stdio, and thin clients) and return them as stored to the trusted
 local CLI, so a remembered credential is readable only with `gbrain recall` on
 the brain host. Search results, the rendered `text` and `entity` cards are

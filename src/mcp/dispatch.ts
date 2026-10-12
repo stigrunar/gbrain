@@ -17,8 +17,10 @@ import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
 import { cliRenderContext, orderNotices, redactForTransport, renderNotice, toAgentError, toolErrorResult, toolResultWithNotices, type Notice, type RenderContext } from '../core/agent-output.ts';
 import { cliOnlyRefusal, isCallable } from '../core/ops/callable.ts';
 import { hostFix, scopeDeniedError } from '../core/ops/op-fix.ts';
-import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTests, type NoticeLedger } from '../core/notice-ledger.ts';
+import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTests, type NoticeLedger, type NoticeAudience } from '../core/notice-ledger.ts';
 import { logVerbUsage } from '../core/verbs/usage-log.ts';
+import { searchCountLine } from '../core/search/keyword-paging.ts';
+import { dateLabelLine } from '../core/search/date-labels.ts';
 import { localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
 import { hiddenToolHint } from './hidden-tool-hint.ts';
 import { takePostUpgradeMcpNotice } from '../core/post-upgrade-notice.ts';
@@ -39,6 +41,7 @@ import {
 import { backupCheckDisabled, backupNagGate, backupNoticeText, loadBackupStatus } from '../core/backup/status-file.ts';
 import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
 import { operationScopesAllowed } from '../core/scope.ts';
+import { enforceReadTrustFloor } from '../core/eligibility/registry.ts';
 import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
 import { admittedPendingReceipt, type WriteReceipt } from '../core/persistence/types.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
@@ -370,7 +373,7 @@ export function summarizeMcpParams(opName: string, params: unknown): ParamSummar
 /**
  * Model-visible notices the search/query ops attach to `_meta.retrieval`: the
  * D8 empty-retrieval diagnosis, a reconciled type filter, other names declared in the evidence, and saved
- * facts that match the query. Each rides as its own text block after the
+ * facts that match the query, search's keyword count line and the row-date label. Each rides as its own text block after the
  * results (content[0] stays the bare result array for thin clients).
  */
 export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): string[] {
@@ -379,7 +382,9 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
   const r = retrieval as {
     type_filter_notice?: unknown;
     other_names?: Array<{ name: string; alias: string; slug: string }>;
-    saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string }>;
+    saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string; linked_from?: string }>;
+    answer_id?: unknown;
+    feedback?: { rateable?: boolean; how_to_rate?: string };
   };
   const blocks: string[] = empty ? [empty] : [];
   if (typeof r.type_filter_notice === 'string') blocks.push(r.type_filter_notice);
@@ -389,17 +394,35 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
     blocks.push(`${text}${more ? ` (+${more} more)` : ''}.`);
   }
   if (r.saved_facts?.length) {
-    const { text, more } = wholeItemsWithin('Saved facts (remember) matching this query, newest first; recall returns more:\n',
-      r.saved_facts.map(f => `- ${f.fact} [entity: ${f.entity_slug ?? 'none'}; saved ${String(f.valid_from).slice(0, 10)}; provenance: ${f.source}]`),
+    const { text, more } = wholeItemsWithin('Saved facts (remember): about the entity this query names (newest first), then facts those point to, then matches for its words; recall returns more:\n',
+      r.saved_facts.map(f => `- ${f.fact} [entity: ${f.entity_slug ?? 'none'}; saved ${String(f.valid_from).slice(0, 10)}; provenance: ${f.source}${f.linked_from ? `; named in a saved fact about ${f.linked_from}` : ''}]`),
       '\n', SAVED_FACTS_NOTICE_MAX_CHARS);
     blocks.push(more ? `${text}\n(+${more} more; recall returns them)` : text);
   }
+  // F2: which set the rows are and which set the keyword count covers, on every search call.
+  const countLine = searchCountLine(result, retrieval);
+  if (countLine) blocks.push(countLine);
+  // F4: what each row's effective_date is (document, event or fallback date), never contractual validity.
+  const dateLine = dateLabelLine(result);
+  if (dateLine) blocks.push(dateLine);
+  if (typeof r.answer_id === 'string' && r.feedback?.rateable === true) blocks.push(rateLine(r.answer_id, typeof r.feedback.how_to_rate === 'string'));
   return blocks;
+}
+
+/**
+ * #6192: the rateable answer's id on the model-visible channel (hosts that
+ * show only `content[]` never see `_meta`). Short on every rateable answer;
+ * the fuller wording on the answers where the `how_to_rate` cadence fires.
+ */
+function rateLine(answerId: string, coach: boolean): string {
+  const call = `rate_answer { answer_id: "${answerId}", rating: 1-5 }`;
+  return (coach ? `Rate this answer after you use it: ${call}. Ratings tune this brain's ranking.` : `Rate after use: ${call}`).slice(0, RATE_LINE_MAX_CHARS);
 }
 
 /** C4: character ceilings for the model-visible notice blocks (header included). */
 export const SAVED_FACTS_NOTICE_MAX_CHARS = 1_500;
 export const OTHER_NAMES_NOTICE_MAX_CHARS = 400;
+export const RATE_LINE_MAX_CHARS = 160;
 
 /**
  * Whole items after `head` while the block stays within `max` characters;
@@ -573,15 +596,37 @@ export function localCallErrorEnvelope(tool: string, e: unknown) {
  * ServeHttpContext ledger. Session identity is the transport-resolved id only.
  * Fail-open: a ledger fault delivers every notice.
  */
+function noticeAudience(opts: DispatchOpts): NoticeAudience {
+  return { transport: opts.transport === 'stdio' ? 'stdio' : opts.remote === false ? 'cli' : 'http', principal: opts.auth?.clientId, sessionId: opts.sessionId };
+}
+
 function admitNotices(notices: Notice[], opts: DispatchOpts): Notice[] {
   if (notices.length === 0) return notices;
   try {
-    const principal = opts.auth?.clientId;
-    const transport = opts.transport === 'stdio' ? 'stdio' : opts.remote === false ? 'cli' : 'http';
-    return (opts.noticeLedger ?? processNoticeLedger()).admit(notices,
-      { transport, principal, sessionId: opts.sessionId }, mutedNoticeCodes(principal ?? (transport === 'stdio' ? 'stdio' : undefined)));
+    const audience = noticeAudience(opts);
+    return (opts.noticeLedger ?? processNoticeLedger()).admit(notices, audience,
+      mutedNoticeCodes(audience.principal ?? (audience.transport === 'stdio' ? 'stdio' : undefined)));
   } catch {
     return notices;
+  }
+}
+
+/**
+ * Cat 40 R0: a search/query whose reranker failed counts toward this
+ * session's reranker-degraded calls, and its own `_meta.retrieval` records
+ * the reason, the fallback and that count (no `fields: "full"` needed).
+ * Returns the session count, or undefined when the reranker did not fail.
+ */
+function recordRerankDegradation(responseMeta: Record<string, unknown>, opts: DispatchOpts): number | undefined {
+  try {
+    const retrieval = responseMeta.retrieval as { degraded?: Array<{ stage?: string; reason?: string }> } | undefined;
+    const failed = retrieval?.degraded?.find(d => d.stage === 'rerank_failed');
+    if (!retrieval || !failed) return undefined;
+    const calls = (opts.noticeLedger ?? processNoticeLedger()).tally(noticeAudience(opts), 'rerank_failed');
+    responseMeta.retrieval = { ...retrieval, rerank_degraded: { reason: failed.reason ?? 'provider_error', fallback: 'fused_order', calls_this_session: calls } };
+    return calls;
+  } catch {
+    return undefined;
   }
 }
 
@@ -795,10 +840,11 @@ export async function dispatchToolCall(
   // `dry_run` are allowlisted inside findUnknownParams. The mode resolves
   // dual-plane (DB > file > 'warn') once per dispatch, and only when an
   // unknown key actually exists — the all-declared common case pays no
-  // config read.
+  // config read. #5970: a write (`op.mutating`) rejects in every mode; the
+  // warn grace period would commit a row with the misnamed field dropped.
   const unknownParamWarnings = findUnknownParams(op, safeParams);
   if (unknownParamWarnings.length > 0) {
-    const strictMode = await resolveStrictParamsMode(engine, opts.config ?? loadConfig());
+    const strictMode = op.mutating === true ? 'reject' : await resolveStrictParamsMode(engine, opts.config ?? loadConfig());
     if (strictMode === 'reject') {
       logVerb(false);
       // Privacy (amendment 11): the raw unknown key rides `suggestion` ONLY.
@@ -812,7 +858,7 @@ export async function dispatchToolCall(
           : `Unknown parameter "${w.param}".`)
         .join(' ');
       const strict = new OperationError('invalid_params',
-        `${n} unknown parameter${n === 1 ? '' : 's'} not declared in the ${name} tool schema (mcp.strict_params=reject). See suggestion for the submitted name${n === 1 ? '' : 's'}.`,
+        `${n} unknown parameter${n === 1 ? '' : 's'} not declared in the ${name} tool schema (${op.mutating === true ? 'write operations always reject unknown parameters; nothing was written' : 'mcp.strict_params=reject'}). See suggestion for the submitted name${n === 1 ? '' : 's'}.`,
         suggestion);
       if (isVerb) strict.protocolVersion = MEMORY_VERBS_VERSION;
       return errorResult(strict, opts, { op: name });
@@ -881,6 +927,8 @@ export async function dispatchToolCall(
     // run inside the handlers; this stops an unfenced write op from being
     // a silent hole. See CLIENT_FENCED_WRITE_OPS in operations.ts.
     enforceBoundClientOpAllowList(ctx.auth, op);
+    // #5575 CEO-18: a floored connection only reaches read ops that enforce its floor.
+    enforceReadTrustFloor(ctx.auth, op);
     const sharedStdio = ctx.transport === 'stdio' && !ctx.auth &&
       (op.requiredScopes?.length || ['list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack'].includes(name));
     let registration: Awaited<ReturnType<typeof readLocalWriter>> | undefined;
@@ -930,8 +978,9 @@ export async function dispatchToolCall(
       notices.push({ code: 'unknown_param', kind: 'info', why: buildUnknownParamWarnBlock([w]) });
     }
     // Lane F (F3): degraded recall and a source binding that narrowed an empty read.
+    const rerankDegradedCalls = recordRerankDegradation(responseMeta, opts);
     notices.push(...recallInteropNotices(name, result, responseMeta, safeParams,
-      { config: ctx.config, transport: dispatchRenderContext(opts).transport, binding: ctx.explicitReadBinding }));
+      { config: ctx.config, transport: dispatchRenderContext(opts).transport, binding: ctx.explicitReadBinding, rerankDegradedCalls }));
     // Monthly backup-coverage: one AGGREGATE notice per process (counts only —
     // never a local path or source id). The refresher runs on the stdio
     // transport ONLY — the WP1/D7 locality axis localOnly ops use; 'http' or
